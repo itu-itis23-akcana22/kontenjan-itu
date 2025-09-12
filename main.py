@@ -1,15 +1,9 @@
-#TODO ders idleri program çalıştığında sadece bir kere fetch edilecek ve variable olarak program bitene kadar tutulacak. lesson_id.json gibi de tutulabilir, zaten değişen bir şey değil. boşa request atılıyor bu haliyle.
 #TODO user_info.json program başında bir kere okunacak. save almak için bir fonksiyon yazılacak. user_info argüman olarak verilebilir.
-#TODO send_message çalıştığında admine bilgilendirme mesajı gidecek (opsiyonel)
-#TODO daha iyi error handling ve logging gerekiyor. her mesaj ve requestte olması şart. özellikle main_loop asla bozulmamalı.
 #TODO loglar ayrı bir dosyaya kaydedilecek.
 #TODO tüm admin komutlarında admin id kontrolü yapılmalı. 
-#TODO program cloudda çalıştığındaki amerikan saati sorunu çözülmeli.
 
 """
-            *** GELİŞTİRİLEBİLECEK YENİLİKLER ***
-- genel olarak daha moduler bir yapı kurulabilir. 
-- json yerine sql database kullanılabilir. çok da gerekli değil sanki
+            *** GELISTIRME ONERISI***
 - her bir user için dil tercihi getirilebilir. Tüm mesajların ingilizceleri de yazılır.
 - kontenjan mesajı atılırken bu mesajın kaç kişiye daha atıldığı bilgisi eklenebilir.
 """
@@ -24,6 +18,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from bs4 import BeautifulSoup
 
 load_dotenv()
 
@@ -36,6 +31,11 @@ subscriptions = {}
 
 is_subs_updated = False
 request_count = 0
+
+is_branch_codes_fetched = False
+branch_dict = {}
+
+last_msg_times = {}
 
 # Log settings
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -67,6 +67,25 @@ def load_subscriptions():
     else:
         subscriptions_local = {}
 
+def log_user_info(user_id, user_info):
+    if not os.path.exists(USER_FILE):
+        with open(USER_FILE, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+    with open(USER_FILE, "r", encoding="utf-8") as f:
+        try:
+            users = json.load(f)
+            if not isinstance(users, dict): 
+                users = {}
+        except json.JSONDecodeError: 
+            users = {}
+
+    if user_id not in users:
+        users[user_id] = user_info 
+
+        with open(USER_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=4, ensure_ascii=False)
+
 def fetch_branch_codes():
     url = "https://obs.itu.edu.tr/public/DersProgram/SearchBransKoduByProgramSeviye?programSeviyeTipiAnahtari=LS"
     
@@ -79,9 +98,13 @@ def fetch_branch_codes():
 
 def take_option_value(branch_code):
     """Verilen branş kodunun opsiyon değerini döner."""
-    branch_codes = fetch_branch_codes()
-    
-    branch_dict = {branch['dersBransKodu']: branch['bransKoduId'] for branch in branch_codes}
+    global is_branch_codes_fetched
+    global branch_dict
+
+    if not is_branch_codes_fetched:
+        branch_codes = fetch_branch_codes()
+        branch_dict = {branch['dersBransKodu']: branch['bransKoduId'] for branch in branch_codes}
+        is_branch_codes_fetched = True
     
     return branch_dict.get(branch_code, -1)
 
@@ -107,26 +130,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "last_name": update.message.from_user.last_name,
     }
     
-    ##################################################################
-    # USER INFO LOGGER
-    if not os.path.exists(USER_FILE):
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-
-    with open(USER_FILE, "r", encoding="utf-8") as f:
-        try:
-            users = json.load(f)
-            if not isinstance(users, dict): 
-                users = {}
-        except json.JSONDecodeError: 
-            users = {}
-
-    if user_id not in users:
-        users[user_id] = user_info 
-
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=4, ensure_ascii=False)
-    ##################################################################
+    log_user_info(user_id, user_info)
 
     if lesson_id == -1:
         await update.message.reply_text('Lütfen geçerli bir ders kodu girin: /subscribe <DERS_KODU> <CRN>')
@@ -172,26 +176,7 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "last_name": update.message.from_user.last_name,
     }
     
-    ##################################################################
-    # USER INFO LOGGER
-    if not os.path.exists(USER_FILE):
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-
-    with open(USER_FILE, "r", encoding="utf-8") as f:
-        try:
-            users = json.load(f)  
-            if not isinstance(users, dict):  
-                users = {}
-        except json.JSONDecodeError:  
-            users = {}
-
-    if user_id not in users:
-        users[user_id] = user_info  
-
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=4, ensure_ascii=False)
-    ##################################################################
+    log_user_info(user_id, user_info)
 
     sub_cancelled = False
     if user_id in subscriptions:
@@ -213,26 +198,7 @@ async def clear_all_subscriptions(update: Update, context: ContextTypes.DEFAULT_
         "last_name": update.message.from_user.last_name,
     }
 
-    ##################################################################
-    # USER INFO LOGGER
-    if not os.path.exists(USER_FILE):
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-
-    with open(USER_FILE, "r", encoding="utf-8") as f:
-        try:
-            users = json.load(f)  
-            if not isinstance(users, dict):  
-                users = {}
-        except json.JSONDecodeError:  
-            users = {}
-    
-    if user_id not in users:
-        users[user_id] = user_info  
-
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=4, ensure_ascii=False)
-    ##################################################################
+    log_user_info(user_id, user_info)
 
     # Kullanıcının aboneliklerini kontrol et
     if user_id in subscriptions and subscriptions[user_id]:
@@ -252,26 +218,7 @@ async def sublist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "last_name": update.message.from_user.last_name,
     }
     
-    ##################################################################
-    # USER INFO LOGGER
-    if not os.path.exists(USER_FILE):
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump({}, f)
-    
-    with open(USER_FILE, "r", encoding="utf-8") as f:
-        try:
-            users = json.load(f)  
-            if not isinstance(users, dict):  
-                users = {}
-        except json.JSONDecodeError:  
-            users = {}
-
-    if user_id not in users:
-        users[user_id] = user_info  
-        
-        with open(USER_FILE, "w", encoding="utf-8") as f:
-            json.dump(users, f, indent=4, ensure_ascii=False)
-    ##################################################################
+    log_user_info(user_id, user_info)
 
     # Kullanıcının abone olduğu dersleri kontrol et
     if user_id in subscriptions and subscriptions[user_id]:
@@ -303,10 +250,8 @@ async def updateallusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         total_sub += sub_num
     await update.message.reply_text(f"User Number: {len(subscriptions.keys())}\nTotal Subscription: {total_sub}\n")
     logger.info(f"Request Count: {request_count}")
-  
 
 async def check_capacity_optimized(context):
-    # Abonelikleri ders kodu bazında grupla
     subscriptions_by_lesson = {}
     for user_id, user_subs in subscriptions.items():
         for lesson_code, crn_code in user_subs:
@@ -329,29 +274,50 @@ async def check_capacity_optimized(context):
                 f"https://obs.itu.edu.tr/public/DersProgram/DersProgramSearch?ProgramSeviyeTipiAnahtari=LS&dersBransKoduId={lesson_id}&__RequestVerificationToken=bilgi_islem_naber"
             )
             response.raise_for_status()
-            data = response.json()
-            dersler = data.get("dersProgramList", [])
-
-            # Güncelleme saati kontrolü
-            guncellenme_saati_str = data.get("guncellenmeSaati", '')
-            try:
-                guncellenme_saati = datetime.strptime(guncellenme_saati_str, "%d.%m.%Y %H:%M:%S")
-            except ValueError:
-                try:
-                    guncellenme_saati = datetime.strptime(guncellenme_saati_str, "%d/%m/%Y %H:%M:%S")
-                except ValueError:
-                    guncellenme_saati = datetime.strptime(guncellenme_saati_str, "%d-%m-%Y %H:%M:%S")
-
-            current_time = datetime.now()
-            program_updated = current_time - guncellenme_saati < timedelta(minutes=1)
-
-            # Yanıttaki tüm CRN'leri bir listede topla
-            valid_crns = [ders['crn'] for ders in dersler]
-
-            # Geçersiz CRN'leri kontrol et
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Guncellenme saati artık gelen responseda olmadigi icin her response guncel kabul ediliyor. ayip ediyon bilgi islem. 
+            
+            table = soup.find('table', {'id': 'dersProgramContainer'})
+            if not table:
+                logger.error(f"Ders programı tablosu bulunamadı: {lesson_code}")
+                continue
+            
+            rows = table.find('tbody').find_all('tr')
+            
+            valid_crns = []
+            dersler = []
+            
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) >= 11: 
+                    crn = cols[0].text.strip()
+                    ders_kodu_element = cols[1].find('a')
+                    ders_kodu = ders_kodu_element.text.strip() if ders_kodu_element else cols[1].text.strip()
+                    ders_adi = cols[2].text.strip()
+                    kontenjan_str = cols[9].text.strip()
+                    yazilan_str = cols[10].text.strip()
+                    
+                    try:
+                        kontenjan = int(kontenjan_str)
+                        ogrenci_sayisi = int(yazilan_str)
+                    except ValueError:
+                        logger.warning(f"Kontenjan veya öğrenci sayısı dönüştürülemedi: {crn}")
+                        continue
+                    
+                    valid_crns.append(crn)
+                    dersler.append({
+                        'crn': crn,
+                        'dersKodu': ders_kodu,
+                        'dersAdi': ders_adi,
+                        'kontenjan': kontenjan,
+                        'ogrenciSayisi': ogrenci_sayisi
+                    })
+            
+            # Check for invalid CRNs and remove subscriptions
             for user_id, crn_code in user_crns:
                 if crn_code not in valid_crns:
-                    # Kullanıcının aboneliğini kaldır
                     if user_id in subscriptions:
                         for subscription in subscriptions[user_id]:
                             if subscription[0] == lesson_code and subscription[1] == crn_code:
@@ -360,27 +326,31 @@ async def check_capacity_optimized(context):
                                 message = f"{lesson_code} {crn_code} geçersiz bir CRN kodu olduğu için aboneliğiniz iptal edilmiştir."
                                 await context.bot.send_message(chat_id=user_id, text=message)
                                 break
-
+            
+            # Check capacity for each course
             for ders in dersler:
                 crn = ders['crn']
                 available_capacity = ders['kontenjan'] - ders['ogrenciSayisi']
-
+                
                 for user_id, crn_code in user_crns:
-                    if crn_code == crn and available_capacity > 0 and program_updated:
-                        message = f"{ders['dersKodu']} {crn} {ders['dersAdi']} için {available_capacity} kontenjan var!"
-                        try:
-                            await context.bot.send_message(chat_id=user_id, text=message)
-                            logger.info(f"ID:{user_id} Kullanısına '{message}' mesajı gönderilmiştir.")
-                        except:
-                            logger.info(f"ID:{user_id} Kullanısına mesaj gönderilememiştir.")
-
+                    if crn_code == crn and available_capacity > 0:
+                        if last_msg_times.get((user_id,crn)) is None or (datetime.now() - last_msg_times[(user_id,crn)]) > timedelta(minutes=3): # Prevent spamming
+                            message = f"{ders['dersKodu']} {crn} {ders['dersAdi']} için {available_capacity} kontenjan var!"
+                            last_msg_times[(user_id,crn)] = datetime.now()
+                            try:
+                                await context.bot.send_message(chat_id=user_id, text=message)
+                                logger.info(f"ID:{user_id} Kullanısına '{message}' mesajı gönderilmiştir.")
+                            except:
+                                logger.info(f"ID:{user_id} Kullanısına mesaj gönderilememiştir.")
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Ders kodu {lesson_code} için istek atılırken hata oluştu: {e}")
             continue
+        except Exception as e:
+            logger.error(f"HTML parse edilirken hata oluştu {lesson_code}: {e}")
+            continue
 
-    # Bir sonraki kontrol için
-    await asyncio.sleep(5) 
+    await asyncio.sleep(5)
 
 async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -391,10 +361,21 @@ async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.message.chat_id 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
 
+    user_info = {
+        "username": update.message.from_user.username,
+        "first_name": update.message.from_user.first_name,
+        "last_name": update.message.from_user.last_name,
+    }
+    
+    log_user_info(user_id, user_info)
+
     with open("messages.txt", "a", encoding="utf-8") as f:
         f.write(f"{timestamp} - Kullanıcı ID: {user_id} - Mesaj: {user_message}\n")
 
     await update.message.reply_text('Mesajınız admin\'e iletildi. Teşekkür ederiz!')
+
+    # admin bilgilendirmesi
+    await context.bot.send_message(chat_id=ADMIN_ID, text=f"Yeni mesaj var!\n\nKullanıcı ID: {user_id}\nMesaj: {user_message}")
 
 async def read_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Only for admin
@@ -465,8 +446,8 @@ async def shutdown_message(update: Update, application):
     """Sunucu kapanmadan önce tüm kullanıcılara bir mesaj gönderir."""
     for user_id in subscriptions.keys():
         try:
-            await application.bot.send_message(chat_id=user_id, text="Add-Drop haftası bittiği için bot kapanacaktır. İleriki ders seçim dönemlerinde de bir aksilik olmazsa bot kullanıma açılacaktır. Botu engellemediğiniz takdirde bot yeniden aktif olduğunda bildirim alabilirsiniz.\n\nUmarım istediğiniz dersleri alabilmişsinizdir. Hepinize iyi bir dönem dilerim. Bir sonraki ders seçim haftası görüşmek üzere.\n\nNot: /clearall komutunu kullanarak aktif aboneliklerinizi tek seferde temizleyebilirsiniz.\n/sendmessage komutu ile botla ilgili sorunları ve geliştirmek için önerilerinizi iletebilirsiniz.\n\nBot bu mesajdan sonraki 1 saat içerisinde kapanacaktır ve kapalı kaldığı süre boyunca yazacağınız komutlar çalışmayacaktır.")
-            # await application.bot.send_message(chat_id=user_id, text="Bot bakımdadır en kısa sürede tekrar aktif olacaktır, sabrınız için teşekkürler. (Bot tekrar aktif olduğunda bildirim alacaksınız.)")
+            # await application.bot.send_message(chat_id=user_id, text="Add-Drop haftası bittiği için bot kapanacaktır. İleriki ders seçim dönemlerinde de bir aksilik olmazsa bot kullanıma açılacaktır. Botu engellemediğiniz takdirde bot yeniden aktif olduğunda bildirim alabilirsiniz.\n\nUmarım istediğiniz dersleri alabilmişsinizdir. Hepinize iyi bir dönem dilerim. Bir sonraki ders seçim haftası görüşmek üzere.\n\nNot: /clearall komutunu kullanarak aktif aboneliklerinizi tek seferde temizleyebilirsiniz.\n/sendmessage komutu ile botla ilgili sorunları ve geliştirmek için önerilerinizi iletebilirsiniz.\n\nBot bu mesajdan sonraki 1 saat içerisinde kapanacaktır ve kapalı kaldığı süre boyunca yazacağınız komutlar çalışmayacaktır.")
+            await application.bot.send_message(chat_id=user_id, text="Bot bakımdadır en kısa sürede tekrar aktif olacaktır, sabrınız için teşekkürler. (Bot tekrar aktif olduğunda bildirim alacaksınız.)")
         except:
             print(f"Chat id {user_id} kullanıcısına mesaj gönderilemedi.")
 
@@ -477,7 +458,11 @@ def handle_shutdown(application):
 
 async def main_loop(context):
     while True:
-        await check_capacity_optimized(context)
+        try:
+            await check_capacity_optimized(context)
+        except Exception as e:
+            logger.error(f"Main loop sırasında hata oluştu: {e}")
+            
         await asyncio.sleep(28)
 
 def main():

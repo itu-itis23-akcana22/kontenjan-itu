@@ -3,3 +3,4 @@ python-telegram-bot
 python-dotenv
 matplotlib
 termcolor
+beautifulsoup4
