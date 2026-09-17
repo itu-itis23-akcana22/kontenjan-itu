@@ -1,6 +1,4 @@
 #TODO user_info.json program başında bir kere okunacak. save almak için bir fonksiyon yazılacak. user_info argüman olarak verilebilir.
-#TODO loglar ayrı bir dosyaya kaydedilecek.
-#TODO tüm admin komutlarında admin id kontrolü yapılmalı. 
 
 """
             *** GELISTIRME ONERISI***
@@ -26,8 +24,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID"))
 TOKEN = os.getenv("BOT_TOKEN")
 SUBSCRIPTION_FILE = 'subscriptions.json'
 USER_FILE = 'user_info.json'
+BLOCKED_CRN_FILE = 'blocked_crns.json'
 
 subscriptions = {}
+blocked_crns = set()   # Yeni aboneliğe kapatılmış CRN kodları
+crn_details = {}       # crn -> (ders_kodu, ders_adi). Kontenjan kontrolü sırasında doldurulur.
 
 is_subs_updated = False
 request_count = 0
@@ -38,12 +39,34 @@ branch_dict = {}
 last_msg_times = {}
 
 # Log settings
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+os.makedirs('logs', exist_ok=True)
+log_filename = f"logs/bot_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.log"
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-def save_subscriptions():
-    with open(SUBSCRIPTION_FILE, 'w') as f:
-        json.dump(subscriptions, f)
+def save_subscriptions(): # düz json.dump kullanmıyorum görsel olarak böyle daha hoş duruyor.
+    with open(SUBSCRIPTION_FILE, 'w', encoding='utf-8') as f:
+        f.write('{\n')
+
+        user_ids = list(subscriptions.keys())
+        
+        for i, user_id in enumerate(user_ids):
+            subscription_list = [list(sub) for sub in subscriptions[user_id]]
+            subscription_json = json.dumps(subscription_list, separators=(',', ': '))
+            
+            if i == len(user_ids) - 1:  # Last item, no comma
+                f.write(f'"{user_id}": {subscription_json}\n')
+            else:  # Add comma for all except last
+                f.write(f'"{user_id}": {subscription_json},\n')
+        
+        f.write('}')
     logger.info("Abonelikler Kaydedildi...")
 
 def load_subscriptions():
@@ -66,6 +89,31 @@ def load_subscriptions():
             subscriptions_local = {}
     else:
         subscriptions_local = {}
+
+def save_blocked_crns():
+    with open(BLOCKED_CRN_FILE, 'w', encoding='utf-8') as f:
+        json.dump(sorted(blocked_crns), f, indent=4, ensure_ascii=False)
+    logger.info("Aboneliğe kapalı CRN listesi kaydedildi...")
+
+def load_blocked_crns():
+    global blocked_crns
+    if os.path.exists(BLOCKED_CRN_FILE):
+        try:
+            with open(BLOCKED_CRN_FILE, 'r', encoding='utf-8') as f:
+                blocked_crns = {str(crn) for crn in json.load(f)}
+        except (json.decoder.JSONDecodeError, TypeError):
+            blocked_crns = set()
+    else:
+        blocked_crns = set()
+
+def count_crn_subscribers(crn_code):
+    """Verilen CRN koduna abone olan kullanıcı sayısını döner."""
+    total = 0
+    for user_subs in subscriptions.values():
+        for sub in user_subs:
+            if sub[1] == crn_code:
+                total += 1
+    return total
 
 def log_user_info(user_id, user_info):
     if not os.path.exists(USER_FILE):
@@ -109,10 +157,10 @@ def take_option_value(branch_code):
     return branch_dict.get(branch_code, -1)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('Merhaba! Kontenjan durumunu öğrenmek için\n/subscribe <DERS_KODU> <CRN> komutunu kullanın. (Yalnızca Lisans seviyesi dersler!)\n\nTüm komutları görmek için /help komutunu kullanın.')
+    await update.message.reply_text('Merhaba! Kontenjan durumunu öğrenmek için\n/subscribe <DERS_KODU> <CRN> komutunu kullanın.\n(Yalnızca Lisans seviyesi dersler!)\n\nTüm komutları görmek için /help komutunu kullanın.')
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('/subscribe <DERS_KODU> <CRN>  -  Bir derse abone ol.\n/unsubscribe <DERS_KODU> <CRN>  -  Abonelikten ayrıl.\n/sublist  -  Aktif tüm abonelikleri göster.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547" \n\nBu bot abone olduğunuz derslere ait ders programı güncellendikten sonra ilgili derslerin kontenjan durumlarını kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız.\n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin sistemlerinde yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer kapandığı takdirde kullanıcılara bilgilendirme mesajı gönderilecektir.')
+    await update.message.reply_text('/subscribe <DERS_KODU> <CRN>  -  Bir derse abone ol.\n/unsubscribe <DERS_KODU> <CRN>  -  Abonelikten ayrıl.\n/sublist  -  Aktif tüm abonelikleri göster.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547" \n\nBu bot abone olduğunuz derslerin kontenjan durumlarını belirli aralıklarla kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız.\nNOT: Bir ders için kontenjan var mesajı aldıktan sonra spama düşmemek amacıyla aynı ders için sonraki 3 dakika boyunca mesaj almazsınız, diğer derslerin kontrolü devam eder. \n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer admin tarafından kapatıldığı durumda kullanıcılara bilgilendirme mesajı gönderilecektir.')
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 2:
@@ -146,6 +194,11 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.message.reply_text(f'{lesson_code} {crn_code} için zaten abone oldunuz.')
                 return
 
+    if crn_code in blocked_crns:
+        await update.message.reply_text('Bu derse geçici olarak abone olamazsınız.')
+        logger.info(f"{user_id} kullanıcısı aboneliğe kapalı {lesson_code} {crn_code} dersine abone olmak istedi.")
+        return
+
     # Kullanıcıyı abone et
     if user_id not in subscriptions:
         subscriptions[user_id] = []
@@ -157,8 +210,12 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for sub in user_subs:
             if sub[0] == lesson_code and sub[1] == crn_code:
                 total_subscribers += 1
-
-    await update.message.reply_text(f'{lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladım.\nBu derse abone {total_subscribers} kişi var.')
+    try:
+        await update.message.reply_text(f'{lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladım.\nBu derse abone {total_subscribers} kişi var.')
+    except Exception as e:
+        logger.error(f"{user_id} kullanıcısına abonelik mesajı gönderilemedi. Hata: {e}")
+    
+    save_subscriptions()  # Abonelikleri kaydet
     logger.info(f"{user_id} kullanıcısı {lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladı.")
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -183,7 +240,10 @@ async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         for subscription in subscriptions[user_id]:
             if subscription[0] == lesson_code and subscription[1] == crn_code:
                 subscriptions[user_id].remove(subscription)
-                await update.message.reply_text(f'{lesson_code} {crn_code} için aboneliğiniz iptal edilmiştir.')
+                try:
+                    await update.message.reply_text(f'{lesson_code} {crn_code} için aboneliğiniz iptal edilmiştir.')
+                except:
+                    logger.error(f"{user_id} kullanıcısına abonelik iptal mesajı gönderilemedi.")
                 sub_cancelled = True
                 
     if not sub_cancelled:
@@ -228,6 +288,12 @@ async def sublist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Henüz herhangi bir derse abone olmadınız.")
 
 async def updateallusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Only for admin
+    admin_id = ADMIN_ID
+    if update.message.chat_id != admin_id:
+        await update.message.reply_text('Bu komutu kullanma yetkiniz yok.')
+        return
+
     save_subscriptions()
     global is_subs_updated
     if not is_subs_updated:
@@ -265,6 +331,8 @@ async def check_capacity_optimized(context):
         if lesson_id == -1:
             logger.warning(f"Geçersiz ders kodu: {lesson_code}")
             continue
+
+        subscribed_crns = {crn_code for _, crn_code in user_crns}
 
         try:
             global request_count
@@ -307,6 +375,8 @@ async def check_capacity_optimized(context):
                         continue
                     
                     valid_crns.append(crn)
+                    if crn in subscribed_crns:  # Abone olunan derslerin adını istatistikler için sakla
+                        crn_details[crn] = (ders_kodu, ders_adi)
                     dersler.append({
                         'crn': crn,
                         'dersKodu': ders_kodu,
@@ -340,8 +410,8 @@ async def check_capacity_optimized(context):
                             try:
                                 await context.bot.send_message(chat_id=user_id, text=message)
                                 logger.info(f"ID:{user_id} Kullanısına '{message}' mesajı gönderilmiştir.")
-                            except:
-                                logger.info(f"ID:{user_id} Kullanısına mesaj gönderilememiştir.")
+                            except Exception as e:
+                                logger.info(f"ID:{user_id} Kullanısına mesaj gönderilememiştir: {e}")
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Ders kodu {lesson_code} için istek atılırken hata oluştu: {e}")
@@ -441,9 +511,168 @@ async def send_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         logger.error(f"Kullanıcı {user_id} ye mesaj gönderilemedi: {e}")
         await update.message.reply_text(f'Kullanıcı {user_id} ye mesaj gönderilemedi. Hata: {e}')
 
+async def send_long_message(update, text):
+    """Telegram mesaj sınırını aşan metinleri satır sonlarından bölerek gönderir."""
+    chunk_limit = 4000
+    chunk = ''
+    for line in text.split('\n'):
+        while len(line) > chunk_limit:  # Tek başına sınırı aşan satır
+            if chunk:
+                await update.message.reply_text(chunk)
+                chunk = ''
+            await update.message.reply_text(line[:chunk_limit])
+            line = line[chunk_limit:]
+
+        if len(chunk) + len(line) + 1 > chunk_limit:
+            await update.message.reply_text(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+
+    if chunk:
+        await update.message.reply_text(chunk)
+
+async def block_crn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bir CRN kodunu yeni aboneliklere kapatır/açar. Mevcut abonelikler etkilenmez."""
+    # Only for admin
+    admin_id = ADMIN_ID
+    if update.message.chat_id != admin_id:
+        await update.message.reply_text('Bu komutu kullanma yetkiniz yok.')
+        return
+
+    if not context.args:  # Argümansız kullanım kapalı CRN listesini gösterir
+        if blocked_crns:
+            listed = "\n".join(f"{crn} - {count_crn_subscribers(crn)} mevcut abone" for crn in sorted(blocked_crns))
+            await update.message.reply_text(f'Aboneliğe kapalı CRN kodları:\n{listed}\n\nDurumu değiştirmek için: /blockcrn <CRN>')
+        else:
+            await update.message.reply_text('Aboneliğe kapalı CRN kodu yok.\nBir CRN kodunu kapatmak için: /blockcrn <CRN>')
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text('Lütfen geçerli formatta giriş yapın: /blockcrn <CRN>')
+        return
+
+    crn_code = context.args[0]
+
+    if not crn_code.isdigit() or len(crn_code) < 4 or len(crn_code) > 5:
+        await update.message.reply_text('CRN kodu 4 veya 5 haneli olmalıdır: /blockcrn <CRN>')
+        return
+
+    current_subscribers = count_crn_subscribers(crn_code)
+
+    if crn_code in blocked_crns:
+        blocked_crns.remove(crn_code)
+        logger.info(f"{crn_code} CRN kodu tekrar aboneliğe açıldı.")
+        message_lines = [f'{crn_code} tekrar aboneliğe açıldı.']
+    else:
+        blocked_crns.add(crn_code)
+        logger.info(f"{crn_code} CRN kodu yeni aboneliklere kapatıldı.")
+        message_lines = [f'{crn_code} yeni aboneliklere kapatıldı. Mevcut abonelikler devam ediyor.']
+
+    save_blocked_crns()
+
+    message_lines.append(f'Bu CRN için mevcut abone sayısı: {current_subscribers}')
+    if crn_code in crn_details:
+        ders_kodu, ders_adi = crn_details[crn_code]
+        message_lines.append(f'Ders: {ders_kodu} {ders_adi}')
+    if blocked_crns:
+        message_lines.append('')
+        message_lines.append('Aboneliğe kapalı tüm CRN kodları: ' + ", ".join(sorted(blocked_crns)))
+
+    await update.message.reply_text("\n".join(message_lines))
+
+async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Abonelikleri ders kodu ve CRN bazında detaylı olarak raporlar."""
+    # Only for admin
+    admin_id = ADMIN_ID
+    if update.message.chat_id != admin_id:
+        await update.message.reply_text('Bu komutu kullanma yetkiniz yok.')
+        return
+
+    crn_stats = {}     # (ders_kodu, crn) -> abone sayısı
+    lesson_stats = {}  # ders_kodu -> {'subs': abonelik sayısı, 'users': kullanıcılar, 'crns': crn kodları}
+    active_users = 0
+    total_subscriptions = 0
+
+    for user_id, user_subs in subscriptions.items():
+        if not user_subs:
+            continue
+
+        active_users += 1
+        total_subscriptions += len(user_subs)
+
+        for lesson_code, crn_code in user_subs:
+            crn_stats[(lesson_code, crn_code)] = crn_stats.get((lesson_code, crn_code), 0) + 1
+
+            lesson = lesson_stats.setdefault(lesson_code, {'subs': 0, 'users': set(), 'crns': set()})
+            lesson['subs'] += 1
+            lesson['users'].add(user_id)
+            lesson['crns'].add(crn_code)
+
+    avg_per_user = total_subscriptions / active_users if active_users > 0 else 0
+
+    lines = []
+    lines.append('=== Genel İstatistikler ===')
+    lines.append(f'Kayıtlı kullanıcı: {len(subscriptions)}')
+    lines.append(f'Aktif aboneliği olan kullanıcı: {active_users}')
+    lines.append(f'Toplam abonelik: {total_subscriptions}')
+    lines.append(f'Farklı ders kodu: {len(lesson_stats)}')
+    lines.append(f'Farklı CRN: {len(crn_stats)}')
+    lines.append(f'Aktif kullanıcı başına ortalama abonelik: {avg_per_user:.2f}')
+
+    lines.append('')
+    lines.append('=== Ders Kodu Bazında ===')
+    if lesson_stats:
+        for lesson_code, data in sorted(lesson_stats.items(), key=lambda item: item[1]['subs'], reverse=True):
+            lines.append(f"{lesson_code}: {data['subs']} abonelik | {len(data['users'])} kullanıcı | {len(data['crns'])} CRN")
+    else:
+        lines.append('Aktif abonelik yok.')
+
+    lines.append('')
+    lines.append('=== CRN Bazında ===')
+    if crn_stats:
+        for (lesson_code, crn_code), subscriber_count in sorted(crn_stats.items(), key=lambda item: item[1], reverse=True):
+            if crn_code in crn_details:
+                ders_kodu, ders_adi = crn_details[crn_code]
+                label = f"{crn_code} - {ders_kodu} {ders_adi}"
+            else:
+                label = f"{crn_code} - {lesson_code} (ders adı henüz alınmadı)"
+
+            blocked_note = ' [ABONELİĞE KAPALI]' if crn_code in blocked_crns else ''
+            lines.append(f"{label}: {subscriber_count} abone{blocked_note}")
+    else:
+        lines.append('Aktif abonelik yok.')
+
+    top_users = sorted(
+        ((user_id, len(user_subs)) for user_id, user_subs in subscriptions.items() if user_subs),
+        key=lambda item: item[1],
+        reverse=True
+    )[:5]
+    if top_users:
+        lines.append('')
+        lines.append('=== En Çok Aboneliği Olan Kullanıcılar ===')
+        for user_id, sub_count in top_users:
+            lines.append(f"{user_id}: {sub_count} abonelik")
+
+    lines.append('')
+    lines.append('=== Aboneliğe Kapalı CRN Kodları ===')
+    if blocked_crns:
+        for crn_code in sorted(blocked_crns):
+            lines.append(f"{crn_code}: {count_crn_subscribers(crn_code)} mevcut abone")
+    else:
+        lines.append('Yok')
+
+    await send_long_message(update, "\n".join(lines))
+
 
 async def shutdown_message(update: Update, application):
     """Sunucu kapanmadan önce tüm kullanıcılara bir mesaj gönderir."""
+    # Only for admin
+    admin_id = ADMIN_ID
+    if update.message.chat_id != admin_id:
+        await update.message.reply_text('Bu komutu kullanma yetkiniz yok.')
+        return
+
     for user_id in subscriptions.keys():
         try:
             # await application.bot.send_message(chat_id=user_id, text="Add-Drop haftası bittiği için bot kapanacaktır. İleriki ders seçim dönemlerinde de bir aksilik olmazsa bot kullanıma açılacaktır. Botu engellemediğiniz takdirde bot yeniden aktif olduğunda bildirim alabilirsiniz.\n\nUmarım istediğiniz dersleri alabilmişsinizdir. Hepinize iyi bir dönem dilerim. Bir sonraki ders seçim haftası görüşmek üzere.\n\nNot: /clearall komutunu kullanarak aktif aboneliklerinizi tek seferde temizleyebilirsiniz.\n/sendmessage komutu ile botla ilgili sorunları ve geliştirmek için önerilerinizi iletebilirsiniz.\n\nBot bu mesajdan sonraki 1 saat içerisinde kapanacaktır ve kapalı kaldığı süre boyunca yazacağınız komutlar çalışmayacaktır.")
@@ -453,7 +682,7 @@ async def shutdown_message(update: Update, application):
 
 def handle_shutdown(application):
     """Kapanış sinyali geldiğinde tetiklenir."""
-    asyncio.create_task(shutdown_message(Update, application))
+    # asyncio.create_task(shutdown_message(Update, application))
     application.stop_running()
 
 async def main_loop(context):
@@ -463,10 +692,11 @@ async def main_loop(context):
         except Exception as e:
             logger.error(f"Main loop sırasında hata oluştu: {e}")
             
-        await asyncio.sleep(28)
+        await asyncio.sleep(58)
 
 def main():
     load_subscriptions()
+    load_blocked_crns()
 
     application = ApplicationBuilder().token(TOKEN).build()
 
@@ -482,6 +712,8 @@ def main():
     application.add_handler(CommandHandler("broadcast", broadcast_message))  # Tüm kullanıcılara mesaj gönderme komutu
     application.add_handler(CommandHandler("clearall", clear_all_subscriptions))  # Tüm abonelikleri temizleme komutu
     application.add_handler(CommandHandler("sendto", send_to_user))  # Belirli bir kullanıcıya mesaj gönderme komutu
+    application.add_handler(CommandHandler("blockcrn", block_crn))  # Bir CRN'i yeni aboneliklere kapatma/açma komutu
+    application.add_handler(CommandHandler("substats", subscription_stats))  # Detaylı abonelik analizi komutu
 
     loop = asyncio.get_event_loop()
     loop.create_task(main_loop(application))
