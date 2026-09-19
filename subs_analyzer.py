@@ -35,8 +35,8 @@ def analyze_subscriptions():
     # Abonelikleri ders kodu bazında grupla
     lesson_code_subscriptions = defaultdict(list)
     for user_id, subs in subscriptions.items():
-        for lesson_code, crn_code in subs:
-            lesson_code_subscriptions[lesson_code].append(user_id)
+        for sub in subs:  # [ders_kodu, crn] veya [ders_kodu, crn, bolum]
+            lesson_code_subscriptions[sub[0]].append(user_id)
 
     # Genel istatistikler
     total_users = len(subscriptions)

@@ -12,8 +12,8 @@ import asyncio
 import signal
 import json
 import os
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -56,39 +56,62 @@ def save_subscriptions(): # düz json.dump kullanmıyorum görsel olarak böyle 
         f.write('{\n')
 
         user_ids = list(subscriptions.keys())
-        
+
         for i, user_id in enumerate(user_ids):
-            subscription_list = [list(sub) for sub in subscriptions[user_id]]
-            subscription_json = json.dumps(subscription_list, separators=(',', ': '))
-            
+            # Bölüm seçimi olmayan abonelikler eski formatta ([ders_kodu, crn]) yazılır
+            subscription_list = [[sub[0], sub[1]] if sub[2] is None else [sub[0], sub[1], sub[2]] for sub in subscriptions[user_id]]
+            subscription_json = json.dumps(subscription_list, separators=(',', ': '), ensure_ascii=False)
+
             if i == len(user_ids) - 1:  # Last item, no comma
                 f.write(f'"{user_id}": {subscription_json}\n')
             else:  # Add comma for all except last
                 f.write(f'"{user_id}": {subscription_json},\n')
-        
+
         f.write('}')
     logger.info("Abonelikler Kaydedildi...")
+
+def normalize_subscription(lesson):
+    """[ders_kodu, crn] veya [ders_kodu, crn, bolum] -> (ders_kodu, crn, bolum). Bölüm seçimi yoksa bolum None olur."""
+    lesson = list(lesson)
+    bolum = lesson[2] if len(lesson) > 2 else None
+    return (lesson[0], lesson[1], bolum)
 
 def load_subscriptions():
     global subscriptions
     subscriptions_local = {}
     if os.path.exists(SUBSCRIPTION_FILE):
         try:
-            with open(SUBSCRIPTION_FILE, 'r') as f:
+            with open(SUBSCRIPTION_FILE, 'r', encoding='utf-8') as f:
                 subscriptions_local = json.load(f)
 
-                for user_id, lessons in subscriptions_local.items(): 
+                for user_id, lessons in subscriptions_local.items():
                     if isinstance(user_id, str):
-                        user_id = int(user_id)  
+                        user_id = int(user_id)
                     if user_id not in subscriptions:
                         subscriptions[user_id] = []
                     for lesson in lessons:
-                        subscriptions[user_id].append(tuple(lesson))
+                        subscriptions[user_id].append(normalize_subscription(lesson))
 
         except json.decoder.JSONDecodeError:
             subscriptions_local = {}
     else:
         subscriptions_local = {}
+
+def find_subscription(user_id, lesson_code, crn_code):
+    """Kullanıcının ilgili derse aboneliğini döner, yoksa None."""
+    for sub in subscriptions.get(user_id, []):
+        if sub[0] == lesson_code and sub[1] == crn_code:
+            return sub
+    return None
+
+def set_subscription_bolum(user_id, lesson_code, crn_code, bolum):
+    """Mevcut aboneliğin bölüm seçimini günceller. Abonelik yoksa False döner."""
+    user_subs = subscriptions.get(user_id, [])
+    for i, sub in enumerate(user_subs):
+        if sub[0] == lesson_code and sub[1] == crn_code:
+            user_subs[i] = (lesson_code, crn_code, bolum)
+            return True
+    return False
 
 def save_blocked_crns():
     with open(BLOCKED_CRN_FILE, 'w', encoding='utf-8') as f:
@@ -156,17 +179,114 @@ def take_option_value(branch_code):
     
     return branch_dict.get(branch_code, -1)
 
+def parse_rezervasyon(text):
+    """Rezervasyon sütununu çözer: 'YZVE_LS/10/7 | Diğer/70/70' ->
+    [{'bolum': 'YZVE_LS', 'kontenjan': 10, 'yazilan': 7}, {'bolum': 'Diğer', 'kontenjan': 70, 'yazilan': 70}]
+    Rezervasyon yoksa ('-') boş liste döner. Bölüm sayısı sınırlı değildir."""
+    rezervasyonlar = []
+    if not text or text.strip() == '-':
+        return rezervasyonlar
+
+    for part in text.split('|'):
+        part = part.strip()
+        if not part:
+            continue
+        pieces = part.rsplit('/', 2)  # bölüm adı / kontenjan / yazılan
+        if len(pieces) != 3:
+            logger.warning(f"Rezervasyon bilgisi çözümlenemedi: {part}")
+            continue
+        try:
+            rezervasyonlar.append({'bolum': pieces[0].strip(), 'kontenjan': int(pieces[1]), 'yazilan': int(pieces[2])})
+        except ValueError:
+            logger.warning(f"Rezervasyon bilgisi çözümlenemedi: {part}")
+
+    return rezervasyonlar
+
+def format_rezervasyon(rezervasyonlar):
+    """Bölüm listesini 'YZVE_LS: 7/10 | Diğer: 70/70' (yazılan/kontenjan) şeklinde metne çevirir."""
+    return " | ".join(f"{rez['bolum']}: {rez['yazilan']}/{rez['kontenjan']}" for rez in rezervasyonlar)
+
+def available_capacity_for(ders, bolum):
+    """Kullanıcının bölüm seçimine göre boş kontenjanı ve baz alınan bölümü döner.
+    Bölüm seçilmemişse (None) ya da seçilen bölüm artık rezervasyonda yoksa toplam kontenjana bakılır."""
+    if bolum is not None:
+        for rez in ders['rezervasyonlar']:
+            if rez['bolum'] == bolum:
+                return rez['kontenjan'] - rez['yazilan'], bolum
+    return ders['kontenjan'] - ders['ogrenciSayisi'], None
+
+def fetch_lesson_table(lesson_code, lesson_id):
+    """Ders programı tablosunu çeker ve satırları sözlük listesi olarak döner. İstek/parse hatalarında exception fırlatır."""
+    global request_count
+    request_count += 1
+
+    response = requests.get(
+        f"https://obs.itu.edu.tr/public/DersProgram/DersProgramSearch?ProgramSeviyeTipiAnahtari=LS&dersBransKoduId={lesson_id}&__RequestVerificationToken=bilgi_islem_naber",
+        timeout=20
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Guncellenme saati artık gelen responseda olmadigi icin her response guncel kabul ediliyor. ayip ediyon bilgi islem.
+
+    table = soup.find('table', {'id': 'dersProgramContainer'})
+    if not table:
+        raise ValueError(f"Ders programı tablosu bulunamadı: {lesson_code}")
+
+    rows = table.find('tbody').find_all('tr')
+
+    dersler = []
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) >= 11:
+            crn = cols[0].text.strip()
+            ders_kodu_element = cols[1].find('a')
+            ders_kodu = ders_kodu_element.text.strip() if ders_kodu_element else cols[1].text.strip()
+            ders_adi = cols[2].text.strip()
+            kontenjan_str = cols[9].text.strip()
+            yazilan_str = cols[10].text.strip()
+            rezervasyon_str = cols[11].text.strip() if len(cols) > 11 else '-'  # Reservasyon Böl./Kont./Yaz. sütunu
+
+            try:
+                kontenjan = int(kontenjan_str)
+                ogrenci_sayisi = int(yazilan_str)
+            except ValueError:
+                logger.warning(f"Kontenjan veya öğrenci sayısı dönüştürülemedi: {crn}")
+                continue
+
+            dersler.append({
+                'crn': crn,
+                'dersKodu': ders_kodu,
+                'dersAdi': ders_adi,
+                'kontenjan': kontenjan,
+                'ogrenciSayisi': ogrenci_sayisi,
+                'rezervasyonlar': parse_rezervasyon(rezervasyon_str)  # Bölüm bazlı kontenjan, yoksa []
+            })
+
+    return dersler
+
+def build_bolum_keyboard(lesson_code, crn_code, rezervasyonlar):
+    """Bölüm seçimi butonları. callback_data: bolum|<ders_kodu>|<crn>|<bolum>  ('*' = toplam kontenjan)"""
+    buttons = [
+        InlineKeyboardButton(f"{rez['bolum']} ({rez['yazilan']}/{rez['kontenjan']})", callback_data=f"bolum|{lesson_code}|{crn_code}|{rez['bolum']}")
+        for rez in rezervasyonlar
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]  # Satır başına 2 buton
+    rows.append([InlineKeyboardButton("Toplam kontenjan (bölüm seçme)", callback_data=f"bolum|{lesson_code}|{crn_code}|*")])
+    return InlineKeyboardMarkup(rows)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text('Merhaba! Kontenjan durumunu öğrenmek için\n/subscribe <DERS_KODU> <CRN> komutunu kullanın.\n(Yalnızca Lisans seviyesi dersler!)\n\nTüm komutları görmek için /help komutunu kullanın.')
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('/subscribe <DERS_KODU> <CRN>  -  Bir derse abone ol.\n/unsubscribe <DERS_KODU> <CRN>  -  Abonelikten ayrıl.\n/sublist  -  Aktif tüm abonelikleri göster.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547" \n\nBu bot abone olduğunuz derslerin kontenjan durumlarını belirli aralıklarla kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız.\nNOT: Bir ders için kontenjan var mesajı aldıktan sonra spama düşmemek amacıyla aynı ders için sonraki 3 dakika boyunca mesaj almazsınız, diğer derslerin kontrolü devam eder. \n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer admin tarafından kapatıldığı durumda kullanıcılara bilgilendirme mesajı gönderilecektir.')
+    await update.message.reply_text('/subscribe <DERS_KODU> <CRN>  -  Bir derse abone ol.\n/unsubscribe <DERS_KODU> <CRN>  -  Abonelikten ayrıl.\n/sublist  -  Aktif tüm abonelikleri göster.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547" \n\nBu bot abone olduğunuz derslerin kontenjan durumlarını belirli aralıklarla kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız.\nNOT: Bir ders için kontenjan var mesajı aldıktan sonra spama düşmemek amacıyla aynı ders için sonraki 3 dakika boyunca mesaj almazsınız, diğer derslerin kontrolü devam eder. \nKontenjanı bölümlere ayrılmış derslerde (örn. YZVE_LS/10/7 | Diğer/70/70) abone olurken bölümünüzü seçebilirsiniz; böylece yalnızca kendi bölümünüzün kontenjanı açıldığında bildirim alırsınız. \n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer admin tarafından kapatıldığı durumda kullanıcılara bilgilendirme mesajı gönderilecektir.')
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 2:
         await update.message.reply_text('Lütfen geçerli formatta giriş yapın: /subscribe <DERS_KODU> <CRN>')
         return
-    
+
     lesson_code = context.args[0]
     lesson_id = take_option_value(lesson_code)
     crn_code = context.args[1]
@@ -177,32 +297,56 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "first_name": update.message.from_user.first_name,
         "last_name": update.message.from_user.last_name,
     }
-    
+
     log_user_info(user_id, user_info)
 
     if lesson_id == -1:
         await update.message.reply_text('Lütfen geçerli bir ders kodu girin: /subscribe <DERS_KODU> <CRN>')
         return
-    
+
     if len(crn_code) < 4 or len(crn_code) > 5:
         await update.message.reply_text('CRN kodu 4 veya 5 haneli olmalıdır: /subscribe <DERS_KODU> <CRN>')
         return
 
-    if user_id in subscriptions:
-        for subscription in subscriptions[user_id]:
-            if subscription[0] == lesson_code and subscription[1] == crn_code:
-                await update.message.reply_text(f'{lesson_code} {crn_code} için zaten abone oldunuz.')
-                return
+    existing_subscription = find_subscription(user_id, lesson_code, crn_code)
 
-    if crn_code in blocked_crns:
+    if existing_subscription is None and crn_code in blocked_crns:
         await update.message.reply_text('Bu derse geçici olarak abone olamazsınız.')
         logger.info(f"{user_id} kullanıcısı aboneliğe kapalı {lesson_code} {crn_code} dersine abone olmak istedi.")
+        return
+
+    # Ders programını çek: CRN doğrulanır ve bölüm bazlı kontenjan (rezervasyon) bilgisi alınır
+    ders = None
+    try:
+        dersler = fetch_lesson_table(lesson_code, lesson_id)
+        ders = next((d for d in dersler if d['crn'] == crn_code), None)
+        if ders is None:
+            await update.message.reply_text(f'{lesson_code} dersleri arasında {crn_code} CRN kodu bulunamadı. Ders kodunu ve CRN\'i kontrol edin: /subscribe <DERS_KODU> <CRN>')
+            return
+        crn_details[crn_code] = (ders['dersKodu'], ders['dersAdi'])
+    except Exception as e:
+        # Tablo çekilemezse eski davranış: doğrulama yapılmadan abone edilir, geçersiz CRN kontrol döngüsünde temizlenir
+        logger.warning(f"{lesson_code} için ders programı çekilemedi, {crn_code} doğrulanmadan devam ediliyor: {e}")
+
+    rezervasyonlar = ders['rezervasyonlar'] if ders else []
+
+    if existing_subscription is not None:
+        if rezervasyonlar:  # Zaten abone; bölüm seçimini değiştirme imkanı ver
+            mevcut_secim = existing_subscription[2] or 'Toplam kontenjan'
+            await update.message.reply_text(
+                f'{lesson_code} {crn_code} için zaten abone oldunuz. Mevcut seçiminiz: {mevcut_secim}\n\n'
+                f'Bu dersin kontenjanı bölümlere ayrılmış (yazılan/kontenjan):\n{format_rezervasyon(rezervasyonlar)}\n'
+                f'Seçiminizi değiştirmek için bölümünüzü seçin:',
+                reply_markup=build_bolum_keyboard(lesson_code, crn_code, rezervasyonlar)
+            )
+        else:
+            await update.message.reply_text(f'{lesson_code} {crn_code} için zaten abone oldunuz.')
         return
 
     # Kullanıcıyı abone et
     if user_id not in subscriptions:
         subscriptions[user_id] = []
-    subscriptions[user_id].append((lesson_code, crn_code))  # Tuple olarak kaydediyoruz
+    subscriptions[user_id].append((lesson_code, crn_code, None))  # Tuple olarak kaydediyoruz, bölüm seçimi butonla yapılır
 
     # İlgili CRN için toplam abone sayısını hesapla
     total_subscribers = 0
@@ -210,13 +354,52 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         for sub in user_subs:
             if sub[0] == lesson_code and sub[1] == crn_code:
                 total_subscribers += 1
+
+    message = f'{lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladım.\nBu derse abone {total_subscribers} kişi var.'
+    reply_markup = None
+    if rezervasyonlar:
+        message += (f'\n\nBu dersin kontenjanı bölümlere ayrılmış (yazılan/kontenjan):\n{format_rezervasyon(rezervasyonlar)}\n'
+                    f'Yalnızca kendi bölümünüzün kontenjanı açıldığında bildirim almak için bölümünüzü seçin. '
+                    f'Seçim yapmazsanız toplam kontenjana göre bildirim alırsınız.')
+        reply_markup = build_bolum_keyboard(lesson_code, crn_code, rezervasyonlar)
+
     try:
-        await update.message.reply_text(f'{lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladım.\nBu derse abone {total_subscribers} kişi var.')
+        await update.message.reply_text(message, reply_markup=reply_markup)
     except Exception as e:
         logger.error(f"{user_id} kullanıcısına abonelik mesajı gönderilemedi. Hata: {e}")
-    
+
     save_subscriptions()  # Abonelikleri kaydet
     logger.info(f"{user_id} kullanıcısı {lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladı.")
+
+async def bolum_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bölüm seçimi butonuna basıldığında aboneliğin bölüm bilgisini günceller."""
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split('|', 3)  # bolum|<ders_kodu>|<crn>|<bolum>
+    if len(parts) != 4:
+        return
+    _, lesson_code, crn_code, bolum = parts
+    if bolum == '*':
+        bolum = None
+
+    user_id = query.message.chat_id if query.message else query.from_user.id
+
+    if set_subscription_bolum(user_id, lesson_code, crn_code, bolum):
+        save_subscriptions()
+        logger.info(f"{user_id} kullanıcısı {lesson_code} {crn_code} için bölüm seçti: {bolum or 'Toplam kontenjan'}")
+        if bolum is None:
+            text = f'{lesson_code} {crn_code} için toplam kontenjana göre bildirim alacaksınız.'
+        else:
+            text = f'{lesson_code} {crn_code} için yalnızca {bolum} bölümünün kontenjanı açıldığında bildirim alacaksınız.'
+    else:
+        text = f'{lesson_code} {crn_code} için aktif aboneliğiniz bulunmuyor. Abone olmak için: /subscribe {lesson_code} {crn_code}'
+
+    try:
+        await query.edit_message_text(text)  # Butonları kaldırıp sonucu yazar
+    except Exception as e:  # Mesaj çok eskiyse düzenlenemez, yeni mesaj gönder
+        logger.warning(f"{user_id} için bölüm seçimi mesajı düzenlenemedi: {e}")
+        await context.bot.send_message(chat_id=user_id, text=text)
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) != 2:
@@ -282,7 +465,7 @@ async def sublist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Kullanıcının abone olduğu dersleri kontrol et
     if user_id in subscriptions and subscriptions[user_id]:
-        lessons = ", ".join([f"{sub[0]} {sub[1]}" for sub in subscriptions[user_id]])  # Tuple'dan formatla
+        lessons = ", ".join([f"{sub[0]} {sub[1]}" + (f" ({sub[2]})" if sub[2] else "") for sub in subscriptions[user_id]])  # Tuple'dan formatla, bölüm seçimi varsa parantezde
         await update.message.reply_text(f"Abone olduğunuz dersler: {lessons}")
     else:
         await update.message.reply_text("Henüz herhangi bir derse abone olmadınız.")
@@ -320,10 +503,10 @@ async def updateallusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def check_capacity_optimized(context):
     subscriptions_by_lesson = {}
     for user_id, user_subs in subscriptions.items():
-        for lesson_code, crn_code in user_subs:
+        for lesson_code, crn_code, bolum in user_subs:
             if lesson_code not in subscriptions_by_lesson:
                 subscriptions_by_lesson[lesson_code] = []
-            subscriptions_by_lesson[lesson_code].append((user_id, crn_code))
+            subscriptions_by_lesson[lesson_code].append((user_id, crn_code, bolum))
 
     # Her ders kodu için sadece bir istek atılacak
     for lesson_code, user_crns in subscriptions_by_lesson.items():
@@ -332,61 +515,18 @@ async def check_capacity_optimized(context):
             logger.warning(f"Geçersiz ders kodu: {lesson_code}")
             continue
 
-        subscribed_crns = {crn_code for _, crn_code in user_crns}
+        subscribed_crns = {crn_code for _, crn_code, _ in user_crns}
 
         try:
-            global request_count
-            request_count += 1
+            dersler = fetch_lesson_table(lesson_code, lesson_id)
+            valid_crns = [ders['crn'] for ders in dersler]
 
-            response = requests.get(
-                f"https://obs.itu.edu.tr/public/DersProgram/DersProgramSearch?ProgramSeviyeTipiAnahtari=LS&dersBransKoduId={lesson_id}&__RequestVerificationToken=bilgi_islem_naber"
-            )
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            
-            # Guncellenme saati artık gelen responseda olmadigi icin her response guncel kabul ediliyor. ayip ediyon bilgi islem. 
-            
-            table = soup.find('table', {'id': 'dersProgramContainer'})
-            if not table:
-                logger.error(f"Ders programı tablosu bulunamadı: {lesson_code}")
-                continue
-            
-            rows = table.find('tbody').find_all('tr')
-            
-            valid_crns = []
-            dersler = []
-            
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) >= 11: 
-                    crn = cols[0].text.strip()
-                    ders_kodu_element = cols[1].find('a')
-                    ders_kodu = ders_kodu_element.text.strip() if ders_kodu_element else cols[1].text.strip()
-                    ders_adi = cols[2].text.strip()
-                    kontenjan_str = cols[9].text.strip()
-                    yazilan_str = cols[10].text.strip()
-                    
-                    try:
-                        kontenjan = int(kontenjan_str)
-                        ogrenci_sayisi = int(yazilan_str)
-                    except ValueError:
-                        logger.warning(f"Kontenjan veya öğrenci sayısı dönüştürülemedi: {crn}")
-                        continue
-                    
-                    valid_crns.append(crn)
-                    if crn in subscribed_crns:  # Abone olunan derslerin adını istatistikler için sakla
-                        crn_details[crn] = (ders_kodu, ders_adi)
-                    dersler.append({
-                        'crn': crn,
-                        'dersKodu': ders_kodu,
-                        'dersAdi': ders_adi,
-                        'kontenjan': kontenjan,
-                        'ogrenciSayisi': ogrenci_sayisi
-                    })
-            
+            for ders in dersler:
+                if ders['crn'] in subscribed_crns:  # Abone olunan derslerin adını istatistikler için sakla
+                    crn_details[ders['crn']] = (ders['dersKodu'], ders['dersAdi'])
+
             # Check for invalid CRNs and remove subscriptions
-            for user_id, crn_code in user_crns:
+            for user_id, crn_code, _ in user_crns:
                 if crn_code not in valid_crns:
                     if user_id in subscriptions:
                         for subscription in subscriptions[user_id]:
@@ -396,16 +536,22 @@ async def check_capacity_optimized(context):
                                 message = f"{lesson_code} {crn_code} geçersiz bir CRN kodu olduğu için aboneliğiniz iptal edilmiştir."
                                 await context.bot.send_message(chat_id=user_id, text=message)
                                 break
-            
+
             # Check capacity for each course
             for ders in dersler:
                 crn = ders['crn']
-                available_capacity = ders['kontenjan'] - ders['ogrenciSayisi']
-                
-                for user_id, crn_code in user_crns:
-                    if crn_code == crn and available_capacity > 0:
+                rezervasyon_str = f" ({format_rezervasyon(ders['rezervasyonlar'])})" if ders['rezervasyonlar'] else ""
+
+                for user_id, crn_code, bolum in user_crns:
+                    if crn_code != crn:
+                        continue
+
+                    # Bölüm seçen kullanıcı için o bölümün, diğerleri için toplam kontenjana bakılır
+                    available_capacity, secilen_bolum = available_capacity_for(ders, bolum)
+                    if available_capacity > 0:
                         if last_msg_times.get((user_id,crn)) is None or (datetime.now() - last_msg_times[(user_id,crn)]) > timedelta(minutes=3): # Prevent spamming
-                            message = f"{ders['dersKodu']} {crn} {ders['dersAdi']} için {available_capacity} kontenjan var!"
+                            bolum_str = f"{secilen_bolum} bölümünde " if secilen_bolum else ""
+                            message = f"{ders['dersKodu']} {crn} {ders['dersAdi']} için {bolum_str}{available_capacity} kontenjan var!{rezervasyon_str}"
                             last_msg_times[(user_id,crn)] = datetime.now()
                             try:
                                 await context.bot.send_message(chat_id=user_id, text=message)
@@ -589,7 +735,7 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text('Bu komutu kullanma yetkiniz yok.')
         return
 
-    crn_stats = {}     # (ders_kodu, crn) -> abone sayısı
+    crn_stats = {}     # (ders_kodu, crn) -> {'subs': abone sayısı, 'bolumler': {bölüm: abone sayısı}}
     lesson_stats = {}  # ders_kodu -> {'subs': abonelik sayısı, 'users': kullanıcılar, 'crns': crn kodları}
     active_users = 0
     total_subscriptions = 0
@@ -601,8 +747,11 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         active_users += 1
         total_subscriptions += len(user_subs)
 
-        for lesson_code, crn_code in user_subs:
-            crn_stats[(lesson_code, crn_code)] = crn_stats.get((lesson_code, crn_code), 0) + 1
+        for lesson_code, crn_code, bolum in user_subs:
+            crn = crn_stats.setdefault((lesson_code, crn_code), {'subs': 0, 'bolumler': {}})
+            crn['subs'] += 1
+            if bolum is not None:
+                crn['bolumler'][bolum] = crn['bolumler'].get(bolum, 0) + 1
 
             lesson = lesson_stats.setdefault(lesson_code, {'subs': 0, 'users': set(), 'crns': set()})
             lesson['subs'] += 1
@@ -631,15 +780,23 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append('')
     lines.append('=== CRN Bazında ===')
     if crn_stats:
-        for (lesson_code, crn_code), subscriber_count in sorted(crn_stats.items(), key=lambda item: item[1], reverse=True):
+        for (lesson_code, crn_code), data in sorted(crn_stats.items(), key=lambda item: item[1]['subs'], reverse=True):
             if crn_code in crn_details:
                 ders_kodu, ders_adi = crn_details[crn_code]
                 label = f"{crn_code} - {ders_kodu} {ders_adi}"
             else:
                 label = f"{crn_code} - {lesson_code} (ders adı henüz alınmadı)"
 
+            bolum_note = ''
+            if data['bolumler']:  # Bölüm seçen abone varsa dağılımı göster
+                parcalar = [f"{bolum}: {count}" for bolum, count in sorted(data['bolumler'].items(), key=lambda item: item[1], reverse=True)]
+                toplam_secenler = data['subs'] - sum(data['bolumler'].values())
+                if toplam_secenler > 0:
+                    parcalar.append(f"Toplam kontenjan: {toplam_secenler}")
+                bolum_note = ' (' + ', '.join(parcalar) + ')'
+
             blocked_note = ' [ABONELİĞE KAPALI]' if crn_code in blocked_crns else ''
-            lines.append(f"{label}: {subscriber_count} abone{blocked_note}")
+            lines.append(f"{label}: {data['subs']} abone{bolum_note}{blocked_note}")
     else:
         lines.append('Aktif abonelik yok.')
 
@@ -714,6 +871,7 @@ def main():
     application.add_handler(CommandHandler("sendto", send_to_user))  # Belirli bir kullanıcıya mesaj gönderme komutu
     application.add_handler(CommandHandler("blockcrn", block_crn))  # Bir CRN'i yeni aboneliklere kapatma/açma komutu
     application.add_handler(CommandHandler("substats", subscription_stats))  # Detaylı abonelik analizi komutu
+    application.add_handler(CallbackQueryHandler(bolum_callback, pattern=r"^bolum\|"))  # Bölüm seçimi butonları
 
     loop = asyncio.get_event_loop()
     loop.create_task(main_loop(application))
