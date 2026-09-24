@@ -453,9 +453,9 @@ def build_open_message(ders, available_capacity, secilen_bolum, others):
     """Kontenjan açıldı bildirimi: ders bilgileri tablo halinde ve bildirimin kaç kişiye daha gönderildiği bilgisiyle."""
     bolum_str = f"{html_escape(secilen_bolum)} bölümünde " if secilen_bolum else ""
     if others > 0:
-        others_str = f"👥 Bu bildirim {others} kişiye daha gönderildi."
+        others_str = f"Bu bildirim {others} kişiye daha gönderildi."
     else:
-        others_str = "👤 Bu bildirim yalnızca size gönderildi."
+        others_str = "Bu bildirim yalnızca size gönderildi."
 
     return (f"🔔 <b>{html_escape(ders['dersKodu'])} {html_escape(ders['crn'])}</b> için {bolum_str}<b>{available_capacity}</b> kontenjan var!\n"
             f"<i>{html_escape(ders['dersAdi'])}</i>\n"
