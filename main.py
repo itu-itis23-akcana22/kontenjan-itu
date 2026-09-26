@@ -14,7 +14,7 @@ import os
 import re
 from html import escape as html_escape
 from itertools import zip_longest
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
@@ -1410,11 +1410,32 @@ def add_handlers(application):
     application.add_handler(CallbackQueryHandler(subscribe_callback, pattern=r"^sub\|", block=False))  # Şube listesi / check abone ol butonları
     application.add_handler(CallbackQueryHandler(sublist_callback, pattern=r"^(unsub|sublist)\|"))  # Abonelik listesi Çık / Yenile butonları
 
+# Sohbetteki "/" komut menüsünde görünen kullanıcı komutları. Admin komutları bilerek eklenmedi.
+USER_COMMANDS = [
+    BotCommand("subscribe", "Derse abone ol (adım adım ya da DERS_KODU CRN)"),
+    BotCommand("check", "Abone olmadan anlık kontenjan sorgula"),
+    BotCommand("sublist", "Aboneliklerini ve doluluklarını göster"),
+    BotCommand("unsubscribe", "Abonelikten ayrıl (DERS_KODU CRN)"),
+    BotCommand("clearall", "Tüm aboneliklerden ayrıl"),
+    BotCommand("cancel", "Adım adım abonelik işlemini iptal et"),
+    BotCommand("sendmessage", "Admine şikayet veya öneri gönder"),
+    BotCommand("help", "Tüm komutlar ve kullanım bilgisi"),
+    BotCommand("start", "Botu başlat"),
+]
+
+async def set_bot_commands(application):
+    """Bot açılırken komut menüsünü Telegram'a kaydeder."""
+    try:
+        await application.bot.set_my_commands(USER_COMMANDS)
+        logger.info("Komut listesi güncellendi.")
+    except Exception as e:
+        logger.error(f"Komut listesi güncellenemedi: {e}")
+
 def main():
     load_subscriptions()
     load_blocked_crns()
 
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).post_init(set_bot_commands).build()
     add_handlers(application)
 
     loop = asyncio.get_event_loop()
