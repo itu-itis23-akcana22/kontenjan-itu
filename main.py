@@ -1414,7 +1414,7 @@ def add_handlers(application):
 USER_COMMANDS = [
     BotCommand("subscribe", "Derse abone ol (adım adım ya da DERS_KODU CRN)"),
     BotCommand("check", "Abone olmadan anlık kontenjan sorgula"),
-    BotCommand("sublist", "Aboneliklerini ve doluluklarını göster"),
+    BotCommand("sublist", "Aboneliklerini görüntüle"),
     BotCommand("unsubscribe", "Abonelikten ayrıl (DERS_KODU CRN)"),
     BotCommand("clearall", "Tüm aboneliklerden ayrıl"),
     BotCommand("cancel", "Adım adım abonelik işlemini iptal et"),
