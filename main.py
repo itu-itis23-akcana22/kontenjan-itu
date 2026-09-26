@@ -19,10 +19,18 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 load_dotenv()
+
+TURKEY_TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+
+def turkey_now():
+    """Return the current time in Türkiye, independent of the server timezone."""
+    return datetime.now(TURKEY_TIMEZONE)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 TOKEN = os.getenv("BOT_TOKEN")
@@ -354,7 +362,7 @@ def fetch_lesson_table(lesson_code, lesson_id):
         timeout=20
     )
     response.raise_for_status()
-    fetched_at = datetime.now()
+    fetched_at = turkey_now()
 
     soup = BeautifulSoup(response.text, 'html.parser')
 
@@ -597,14 +605,14 @@ def set_flow_state(context, state, branch=None):
         context.user_data.pop('subscribe_flow', None)
     else:
         flow = context.user_data.setdefault('subscribe_flow', {})
-        flow['time'] = datetime.now()
+        flow['time'] = turkey_now()
         if branch is not None:
             flow['branch'] = branch
     return state
 
 def subscribe_flow_expired(context):
     flow = context.user_data.get('subscribe_flow')
-    return flow is None or datetime.now() - flow['time'] > SUBSCRIBE_FLOW_TIMEOUT
+    return flow is None or turkey_now() - flow['time'] > SUBSCRIBE_FLOW_TIMEOUT
 
 async def handle_course_input(context, user_id, tokens, retry_state=None):
     """/subscribe girdisini işler ve konuşmanın sonraki durumunu döner:
@@ -726,7 +734,7 @@ async def subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     ders = crn_details.get(crn_code)
-    if ders is not None and datetime.now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
+    if ders is not None and turkey_now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
         dersler = [ders]  # Liste az önce çekildi, tekrar istek atılmaz
     else:
         try:
@@ -1067,7 +1075,7 @@ async def remove_invalid_subscriptions(context, lesson_code, invalid_crns):
 async def notify_subscribers(context, ders, subscribers):
     """Bir şubenin abonelerine kontenjan var / kontenjan doldu mesajlarını gönderir. subscribers: {user_id: bolum}"""
     crn = ders['crn']
-    now = datetime.now()
+    now = turkey_now()
     open_targets = []  # (user_id, boş kontenjan, baz alınan bölüm)
     full_targets = []  # (user_id, baz alınan bölüm)
 
@@ -1101,7 +1109,7 @@ async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_message = " ".join(context.args) 
     user_id = update.message.chat_id 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+    timestamp = turkey_now().strftime("%Y-%m-%d %H:%M:%S") 
 
     remember_user(update)
 
