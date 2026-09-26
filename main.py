@@ -447,8 +447,8 @@ def format_ders_table(ders):
         for i, value in enumerate(values):
             lines.append((label if i == 0 else '').ljust(label_width) + value)
 
-    table = "\n".join(lines)
-    return f"<pre>{html_escape(table)}</pre>"
+    # Avoid Telegram's copy-code button, which appears for <pre> blocks.
+    return "\n".join(html_escape(line) for line in lines)
 
 def capacity_status(yazilan, kontenjan):
     """Doluluk durumunu emoji ile döner: '🟢 47/50 · 3 boş yer' ya da '🔴 50/50 · dolu'"""
@@ -469,6 +469,12 @@ def build_open_message(ders, available_capacity, secilen_bolum, others):
             f"<i>{html_escape(ders['dersAdi'])}</i>\n"
             f"{format_ders_table(ders)}\n"
             f"{others_str}")
+
+def build_open_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📖 Ders kayıt sayfasını aç",
+        url="https://obs.itu.edu.tr/ogrenci/DersKayitIslemleri/DersKayit",
+    )]])
 
 def build_full_message(ders, secilen_bolum):
     """Daha önce kontenjan var bildirimi gönderilen dersin tekrar dolduğunu bildirir."""
@@ -1093,7 +1099,7 @@ async def notify_subscribers(context, ders, subscribers):
         key = (user_id, crn)
         last_msg_times[key] = now
         message = build_open_message(ders, available_capacity, secilen_bolum, others=len(open_targets) - 1)
-        if await send_message_safe(context.bot, user_id, message, parse_mode=ParseMode.HTML):
+        if await send_message_safe(context.bot, user_id, message, parse_mode=ParseMode.HTML, reply_markup=build_open_keyboard()):
             open_notified.add(key)
             logger.info(f"ID:{user_id} Kullanıcısına {ders['dersKodu']} {crn} için {available_capacity} kontenjan var mesajı gönderilmiştir.")
 
