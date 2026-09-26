@@ -14,15 +14,23 @@ import os
 import re
 from html import escape as html_escape
 from itertools import zip_longest
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 load_dotenv()
+
+TURKEY_TIMEZONE = ZoneInfo("Europe/Istanbul")
+
+
+def turkey_now():
+    """Return the current time in Türkiye, independent of the server timezone."""
+    return datetime.now(TURKEY_TIMEZONE)
 
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 TOKEN = os.getenv("BOT_TOKEN")
@@ -354,7 +362,7 @@ def fetch_lesson_table(lesson_code, lesson_id):
         timeout=20
     )
     response.raise_for_status()
-    fetched_at = datetime.now()
+    fetched_at = turkey_now()
 
     soup = BeautifulSoup(response.text, 'html.parser')
 
@@ -439,8 +447,8 @@ def format_ders_table(ders):
         for i, value in enumerate(values):
             lines.append((label if i == 0 else '').ljust(label_width) + value)
 
-    table = "\n".join(lines)
-    return f"<pre>{html_escape(table)}</pre>"
+    # Avoid Telegram's copy-code button, which appears for <pre> blocks.
+    return "\n".join(html_escape(line) for line in lines)
 
 def capacity_status(yazilan, kontenjan):
     """Doluluk durumunu emoji ile döner: '🟢 47/50 · 3 boş yer' ya da '🔴 50/50 · dolu'"""
@@ -461,6 +469,12 @@ def build_open_message(ders, available_capacity, secilen_bolum, others):
             f"<i>{html_escape(ders['dersAdi'])}</i>\n"
             f"{format_ders_table(ders)}\n"
             f"{others_str}")
+
+def build_open_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📖 Ders kayıt sayfasını aç",
+        url="https://obs.itu.edu.tr/ogrenci/DersKayitIslemleri/DersKayit",
+    )]])
 
 def build_full_message(ders, secilen_bolum):
     """Daha önce kontenjan var bildirimi gönderilen dersin tekrar dolduğunu bildirir."""
@@ -597,14 +611,14 @@ def set_flow_state(context, state, branch=None):
         context.user_data.pop('subscribe_flow', None)
     else:
         flow = context.user_data.setdefault('subscribe_flow', {})
-        flow['time'] = datetime.now()
+        flow['time'] = turkey_now()
         if branch is not None:
             flow['branch'] = branch
     return state
 
 def subscribe_flow_expired(context):
     flow = context.user_data.get('subscribe_flow')
-    return flow is None or datetime.now() - flow['time'] > SUBSCRIBE_FLOW_TIMEOUT
+    return flow is None or turkey_now() - flow['time'] > SUBSCRIBE_FLOW_TIMEOUT
 
 async def handle_course_input(context, user_id, tokens, retry_state=None):
     """/subscribe girdisini işler ve konuşmanın sonraki durumunu döner:
@@ -726,7 +740,7 @@ async def subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     ders = crn_details.get(crn_code)
-    if ders is not None and datetime.now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
+    if ders is not None and turkey_now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
         dersler = [ders]  # Liste az önce çekildi, tekrar istek atılmaz
     else:
         try:
@@ -1067,7 +1081,7 @@ async def remove_invalid_subscriptions(context, lesson_code, invalid_crns):
 async def notify_subscribers(context, ders, subscribers):
     """Bir şubenin abonelerine kontenjan var / kontenjan doldu mesajlarını gönderir. subscribers: {user_id: bolum}"""
     crn = ders['crn']
-    now = datetime.now()
+    now = turkey_now()
     open_targets = []  # (user_id, boş kontenjan, baz alınan bölüm)
     full_targets = []  # (user_id, baz alınan bölüm)
 
@@ -1085,7 +1099,7 @@ async def notify_subscribers(context, ders, subscribers):
         key = (user_id, crn)
         last_msg_times[key] = now
         message = build_open_message(ders, available_capacity, secilen_bolum, others=len(open_targets) - 1)
-        if await send_message_safe(context.bot, user_id, message, parse_mode=ParseMode.HTML):
+        if await send_message_safe(context.bot, user_id, message, parse_mode=ParseMode.HTML, reply_markup=build_open_keyboard()):
             open_notified.add(key)
             logger.info(f"ID:{user_id} Kullanıcısına {ders['dersKodu']} {crn} için {available_capacity} kontenjan var mesajı gönderilmiştir.")
 
@@ -1101,7 +1115,7 @@ async def send_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     user_message = " ".join(context.args) 
     user_id = update.message.chat_id 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S") 
+    timestamp = turkey_now().strftime("%Y-%m-%d %H:%M:%S") 
 
     remember_user(update)
 
@@ -1410,11 +1424,32 @@ def add_handlers(application):
     application.add_handler(CallbackQueryHandler(subscribe_callback, pattern=r"^sub\|", block=False))  # Şube listesi / check abone ol butonları
     application.add_handler(CallbackQueryHandler(sublist_callback, pattern=r"^(unsub|sublist)\|"))  # Abonelik listesi Çık / Yenile butonları
 
+# Sohbetteki "/" komut menüsünde görünen kullanıcı komutları. Admin komutları bilerek eklenmedi.
+USER_COMMANDS = [
+    BotCommand("subscribe", "Derse abone ol (adım adım ya da DERS_KODU CRN)"),
+    BotCommand("check", "Abone olmadan anlık kontenjan sorgula"),
+    BotCommand("sublist", "Aboneliklerini görüntüle"),
+    BotCommand("unsubscribe", "Abonelikten ayrıl (DERS_KODU CRN)"),
+    BotCommand("clearall", "Tüm aboneliklerden ayrıl"),
+    BotCommand("cancel", "Adım adım abonelik işlemini iptal et"),
+    BotCommand("sendmessage", "Admine şikayet veya öneri gönder"),
+    BotCommand("help", "Tüm komutlar ve kullanım bilgisi"),
+    BotCommand("start", "Botu başlat"),
+]
+
+async def set_bot_commands(application):
+    """Bot açılırken komut menüsünü Telegram'a kaydeder."""
+    try:
+        await application.bot.set_my_commands(USER_COMMANDS)
+        logger.info("Komut listesi güncellendi.")
+    except Exception as e:
+        logger.error(f"Komut listesi güncellenemedi: {e}")
+
 def main():
     load_subscriptions()
     load_blocked_crns()
 
-    application = ApplicationBuilder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).post_init(set_bot_commands).build()
     add_handlers(application)
 
     loop = asyncio.get_event_loop()
