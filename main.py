@@ -12,12 +12,14 @@ import signal
 import json
 import os
 import re
+import warnings
 from html import escape as html_escape
 from itertools import zip_longest
 from telegram import BotCommand, Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.warnings import PTBUserWarning
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -44,7 +46,10 @@ SUBSCRIBE_FLOW_TIMEOUT = timedelta(minutes=10)  # Adım adım abonelikte cevap i
 MAX_SECTION_BUTTONS = 60                        # Şube listesinde gösterilecek en fazla şube/buton
 MAX_SUBLIST_BUTTONS = 90                        # Abonelik listesinde gösterilecek en fazla "Çık" butonu
 MESSAGE_LIMIT = 4000                            # Telegram mesaj sınırı (4096 karakter) için pay bırakılmış uzunluk
+CALLBACK_DATA_LIMIT = 64                        # Telegram buton verisi (callback_data) için bayt sınırı
 OBS_UNREACHABLE_TEXT = "Şu anda OBS'ye ulaşılamıyor. Lütfen biraz sonra tekrar deneyin."
+
+LISANS, LISANSUSTU = 'LS', 'LU'  # OBS program seviyesi anahtarları (programSeviyeTipiAnahtari)
 
 ASK_COURSE, ASK_DETAIL = range(2)  # Adım adım abonelik (ConversationHandler) durumları
 
@@ -55,7 +60,7 @@ crn_details = {}       # crn -> son çekilen ders bilgisi (fetch_lesson_table s�
 is_subs_updated = False
 request_count = 0
 
-branch_dict = {}
+branch_dicts = {}      # seviye (LS/LU) -> {branş kodu: bransKoduId}. Lisansüstü branş kodları lisanstakilerden farklı olduğu için ayrı tutulur.
 
 last_msg_times = {}    # (user_id, crn) -> son "kontenjan var" mesajının zamanı
 open_notified = set()  # "Kontenjan var" mesajı gönderilmiş, henüz "kontenjan doldu" mesajı gönderilmemiş (user_id, crn) çiftleri
@@ -80,8 +85,7 @@ def save_subscriptions(): # düz json.dump kullanmıyorum görsel olarak böyle 
         user_ids = list(subscriptions.keys())
 
         for i, user_id in enumerate(user_ids):
-            # Bölüm seçimi olmayan abonelikler eski formatta ([ders_kodu, crn]) yazılır
-            subscription_list = [[sub[0], sub[1]] if sub[2] is None else [sub[0], sub[1], sub[2]] for sub in subscriptions[user_id]]
+            subscription_list = [serialize_subscription(sub) for sub in subscriptions[user_id]]
             subscription_json = json.dumps(subscription_list, separators=(',', ': '), ensure_ascii=False)
 
             if i == len(user_ids) - 1:  # Last item, no comma
@@ -93,10 +97,22 @@ def save_subscriptions(): # düz json.dump kullanmıyorum görsel olarak böyle 
     logger.info("Abonelikler Kaydedildi...")
 
 def normalize_subscription(lesson):
-    """[ders_kodu, crn] veya [ders_kodu, crn, bolum] -> (ders_kodu, crn, bolum). Bölüm seçimi yoksa bolum None olur."""
+    """[ders_kodu, crn], [ders_kodu, crn, bolum] veya [ders_kodu, crn, bolum, seviye] -> (ders_kodu, crn, bolum, seviye).
+    Bölüm seçimi yoksa bolum None olur, seviye yazılmamışsa ders lisans (LS) seviyesindedir."""
     lesson = list(lesson)
     bolum = lesson[2] if len(lesson) > 2 else None
-    return (lesson[0], lesson[1], bolum)
+    seviye = lesson[3] if len(lesson) > 3 else LISANS
+    return (lesson[0], lesson[1], bolum, seviye)
+
+def serialize_subscription(sub):
+    """(ders_kodu, crn, bolum, seviye) -> dosyaya yazılacak liste. Lisans abonelikleri eski formatta ([ders_kodu, crn] ya da
+    [ders_kodu, crn, bolum]) yazılır, lisansüstü abonelikler [ders_kodu, crn, bolum, "LU"] olur (bölüm seçimi yoksa bolum null)."""
+    lesson_code, crn_code, bolum, seviye = sub
+    if seviye != LISANS:
+        return [lesson_code, crn_code, bolum, seviye]
+    if bolum is not None:
+        return [lesson_code, crn_code, bolum]
+    return [lesson_code, crn_code]
 
 def load_subscriptions():
     global subscriptions
@@ -151,13 +167,13 @@ def set_subscription_bolum(user_id, lesson_code, crn_code, bolum):
     user_subs = subscriptions.get(user_id, [])
     for i, sub in enumerate(user_subs):
         if sub[0] == lesson_code and sub[1] == crn_code:
-            user_subs[i] = (lesson_code, crn_code, bolum)
+            user_subs[i] = (lesson_code, crn_code, bolum, sub[3])
             return True
     return False
 
-def add_subscription(user_id, lesson_code, crn_code):
-    """Kullanıcıyı derse abone eder. Dosyaya kaydetmek çağıranın sorumluluğundadır."""
-    subscriptions.setdefault(user_id, []).append((lesson_code, crn_code, None))  # Tuple olarak kaydediyoruz, bölüm seçimi butonla yapılır
+def add_subscription(user_id, lesson_code, crn_code, seviye):
+    """Kullanıcıyı verilen seviyedeki (LS/LU) derse abone eder. Dosyaya kaydetmek çağıranın sorumluluğundadır."""
+    subscriptions.setdefault(user_id, []).append((lesson_code, crn_code, None, seviye))  # Tuple olarak kaydediyoruz, bölüm seçimi butonla yapılır
 
 def remove_subscription(user_id, lesson_code, crn_code):
     """Aboneliği kaldırır ve kaldırılıp kaldırılmadığını döner. Dosyaya kaydetmek çağıranın sorumluluğundadır."""
@@ -258,29 +274,27 @@ def remember_user(update: Update):
         "last_name": user.last_name,
     })
 
-def fetch_branch_codes():
-    url = "https://obs.itu.edu.tr/public/DersProgram/SearchBransKoduByProgramSeviye?programSeviyeTipiAnahtari=LS"
-    
+def fetch_branch_codes(seviye):
+    url = f"https://obs.itu.edu.tr/public/DersProgram/SearchBransKoduByProgramSeviye?programSeviyeTipiAnahtari={seviye}"
+
     try:
         response = requests.get(url, timeout=20)
         response.raise_for_status()
-        return response.json()  
+        return response.json()
     except (requests.exceptions.RequestException, ValueError) as e:
-        logger.error(f"Branş kodları alınamadı: {e}")
+        logger.error(f"{seviye} branş kodları alınamadı: {e}")
         return []
 
-async def take_option_value(branch_code):
-    """Verilen branş kodunun opsiyon değerini döner. Geçersiz kodda -1, branş listesi alınamazsa None döner.
-    Liste ilk kullanımda arka planda çekilir; alınamazsa sonraki çağrıda tekrar denenir."""
-    global branch_dict
-
-    if not branch_dict:
-        branch_codes = await asyncio.to_thread(fetch_branch_codes)
-        branch_dict = {branch['dersBransKodu']: branch['bransKoduId'] for branch in branch_codes}
-        if not branch_dict:
+async def take_option_value(branch_code, seviye):
+    """Verilen branş kodunun ilgili seviyedeki (LS/LU) opsiyon değerini döner. Geçersiz kodda -1, branş listesi alınamazsa None döner.
+    Her seviyenin listesi ilk kullanımda arka planda çekilir; alınamazsa sonraki çağrıda tekrar denenir."""
+    if not branch_dicts.get(seviye):
+        branch_codes = await asyncio.to_thread(fetch_branch_codes, seviye)
+        branch_dicts[seviye] = {branch['dersBransKodu']: branch['bransKoduId'] for branch in branch_codes}
+        if not branch_dicts[seviye]:
             return None
-    
-    return branch_dict.get(normalize_code(branch_code), -1)
+
+    return branch_dicts[seviye].get(normalize_code(branch_code), -1)
 
 def parse_rezervasyon(text):
     """Rezervasyon sütununu çözer: 'YZVE_LS/10/7 | Diğer/70/70' ->
@@ -351,14 +365,14 @@ def parse_program(gun_cell, saat_cell):
     saatler = [saat.replace('/', '-') for saat in cell_values(saat_cell)]
     return list(zip_longest(gunler, saatler, fillvalue=''))
 
-def fetch_lesson_table(lesson_code, lesson_id):
-    """Ders programı tablosunu çeker ve satırları sözlük listesi olarak döner. İstek/parse hatalarında exception fırlatır.
+def fetch_lesson_table(lesson_code, lesson_id, seviye):
+    """Verilen seviyedeki (LS/LU) ders programı tablosunu çeker ve satırları sözlük listesi olarak döner. İstek/parse hatalarında exception fırlatır.
     İstek ve HTML parse işlemi uzun sürebildiği için asenkron kodda doğrudan değil fetch_lessons üzerinden çağrılır."""
     global request_count
     request_count += 1
 
     response = requests.get(
-        f"https://obs.itu.edu.tr/public/DersProgram/DersProgramSearch?ProgramSeviyeTipiAnahtari=LS&dersBransKoduId={lesson_id}&__RequestVerificationToken=bilgi_islem_naber",
+        f"https://obs.itu.edu.tr/public/DersProgram/DersProgramSearch?ProgramSeviyeTipiAnahtari={seviye}&dersBransKoduId={lesson_id}&__RequestVerificationToken=bilgi_islem_naber",
         timeout=20
     )
     response.raise_for_status()
@@ -370,7 +384,7 @@ def fetch_lesson_table(lesson_code, lesson_id):
 
     table = soup.find('table', {'id': 'dersProgramContainer'})
     if not table:
-        raise ValueError(f"Ders programı tablosu bulunamadı: {lesson_code}")
+        raise ValueError(f"Ders programı tablosu bulunamadı: {lesson_code} ({seviye})")
 
     rows = table.find('tbody').find_all('tr')
 
@@ -402,14 +416,16 @@ def fetch_lesson_table(lesson_code, lesson_id):
                 'kontenjan': kontenjan,
                 'ogrenciSayisi': ogrenci_sayisi,
                 'rezervasyonlar': parse_rezervasyon(rezervasyon_str),  # Bölüm bazlı kontenjan, yoksa []
+                'seviye': seviye,                                      # Dersin bulunduğu program seviyesi (LS/LU)
                 'guncelleme': fetched_at
             })
 
     return dersler
 
-async def fetch_lessons(lesson_code, lesson_id):
-    """fetch_lesson_table'ı event loop'u bloklamadan arka planda çalıştırır ve gelen ders bilgilerini saklar."""
-    dersler = await asyncio.to_thread(fetch_lesson_table, lesson_code, lesson_id)
+async def fetch_lessons(lesson_code, lesson_id, seviye):
+    """fetch_lesson_table'ı event loop'u bloklamadan arka planda çalıştırır ve gelen ders bilgilerini saklar.
+    CRN'ler lisans ve lisansüstü dersler arasında ortak olmadığı için bilgiler yalnızca CRN'e göre saklanır."""
+    dersler = await asyncio.to_thread(fetch_lesson_table, lesson_code, lesson_id, seviye)
     for ders in dersler:
         crn_details[ders['crn']] = ders
     return dersler
@@ -513,9 +529,10 @@ def bolum_prompt_text(ders, existing_subscription, with_title=False):
                    "Seçim yapmazsanız toplam kontenjana göre bildirim alırsınız.")
 
 def sub_button(lesson_code, ders, subscribed):
-    """Şube listesi ve /check sonuçlarındaki abone ol butonu. 🔔 abone olunabilecek, ✅ abone olunmuş şubeyi gösterir."""
+    """Şube listesi ve /check sonuçlarındaki abone ol butonu. 🔔 abone olunabilecek, ✅ abone olunmuş şubeyi gösterir.
+    callback_data: sub|<ders_kodu>|<crn>|<seviye>"""
     icon = "✅" if subscribed else "🔔"
-    return InlineKeyboardButton(f"{icon} {ders['crn']} · {ders['ogrenciSayisi']}/{ders['kontenjan']}", callback_data=f"sub|{lesson_code}|{ders['crn']}")
+    return InlineKeyboardButton(f"{icon} {ders['crn']} · {ders['ogrenciSayisi']}/{ders['kontenjan']}", callback_data=f"sub|{lesson_code}|{ders['crn']}|{ders['seviye']}")
 
 async def send_blocks(bot, chat_id, blocks, reply_markup=None, parse_mode=ParseMode.HTML, separator="\n\n"):
     """Metin bloklarını Telegram mesaj sınırını aşmayacak şekilde birleştirerek gönderir. Butonlar son mesaja eklenir."""
@@ -528,6 +545,44 @@ async def send_blocks(bot, chat_id, blocks, reply_markup=None, parse_mode=ParseM
 
     for i, chunk in enumerate(chunks):
         await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=parse_mode, reply_markup=reply_markup if i == len(chunks) - 1 else None)
+
+def not_found_scope(lesson_code, seviye):
+    """Bulunamadı mesajlarındaki arama kapsamı. Lisansüstü derslere yalnızca lisans derslerinde bulunamayınca bakıldığı için 'da' eklenir."""
+    return f"{lesson_code} lisansüstü dersleri arasında da" if seviye == LISANSUSTU else f"{lesson_code} dersleri arasında"
+
+def build_graduate_keyboard(action, tokens):
+    """'Lisansüstü mü?' sorusunun butonları. callback_data: lu|<sub/chk>|<girdi> (Evet: girdi lisansüstü derslerde tekrar aranır) ya da lu|no
+    Girdi Telegram'ın buton verisi sınırına sığmıyorsa None döner."""
+    data = f"lu|{action}|{' '.join(tokens)}"
+    if len(data.encode('utf-8')) > CALLBACK_DATA_LIMIT:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🎓 Evet, lisansüstü", callback_data=data),
+        InlineKeyboardButton("Hayır", callback_data="lu|no"),
+    ]])
+
+async def send_not_found(context, chat_id, lines, action, tokens, parse_mode=None):
+    """Lisans derslerinde bulunamayan ders için bulunamadı mesajlarını, dersin lisansüstü olup olmadığını soran butonlarla gönderir.
+    action: 'sub' (abonelik) ya da 'chk' (/check), tokens: Evet denirse lisansüstü derslerde aranacak girdi (ders kodu ve ardından ders numarası/CRN'ler)."""
+    keyboard = build_graduate_keyboard(action, tokens)
+    target = " ".join(tokens)
+    if parse_mode == ParseMode.HTML:
+        target = html_escape(target)
+
+    if keyboard is None:  # Çok sayıda CRN yazılmış, tekrar aranacak girdi butona sığmıyor
+        question = "🎓 Lisansüstü dersler arasında aramak için CRN'leri birkaç komuta bölerek tekrar yazın."
+    else:
+        subject = "Bu dersler lisansüstü ders mi?" if len(tokens) > 2 else "Bu ders lisansüstü bir ders mi?"
+        question = f"🎓 {subject} Öyleyse {target} için lisansüstü derslerde de arayabilirim."
+    await send_blocks(context.bot, chat_id, [*lines[:-1], f"{lines[-1]}\n\n{question}"], keyboard, parse_mode=parse_mode, separator="\n")
+
+async def close_graduate_question(query, text):
+    """'Lisansüstü mü?' sorusunun cevabını onaylar ve butonları kaldırır, soru bir kez cevaplanır."""
+    await query.answer(text)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest as e:
+        logger.warning(f"Lisansüstü sorusunun butonları kaldırılamadı: {e}")
 
 async def send_section_list(context, user_id, lesson_code, sections):
     """Bir dersin şubelerini doluluk, eğitmen ve gün/saat bilgisiyle listeler. Butonlara dokunarak abone olunur."""
@@ -549,12 +604,14 @@ async def send_section_list(context, user_id, lesson_code, sections):
 
     await send_blocks(context.bot, user_id, blocks, InlineKeyboardMarkup(button_rows(buttons)))
 
-async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler):
-    """Kullanıcıyı bir ders kodundaki bir veya birden fazla CRN'e abone eder ve sonucu bildirir.
-    dersler None ise (ders programı çekilemediyse) CRN'ler doğrulanmadan abone olunur, geçersiz olanlar kontrol döngüsünde temizlenir."""
+async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler, seviye):
+    """Kullanıcıyı bir ders kodundaki bir veya birden fazla CRN'e verilen seviyede (LS/LU) abone eder ve sonucu bildirir.
+    dersler None ise (ders programı çekilemediyse) CRN'ler doğrulanmadan abone olunur, geçersiz olanlar kontrol döngüsünde temizlenir.
+    Lisans derslerinde bulunamayan CRN'ler için dersin lisansüstü olup olmadığı sorulur."""
     dersler_by_crn = {ders['crn']: ders for ders in dersler} if dersler is not None else None
     results = []
     bolum_prompts = []  # Kontenjanı bölümlere ayrılmış dersler: (ders, mevcut abonelik)
+    not_found = []      # Lisans derslerinde bulunamayan CRN'ler, lisansüstü derslerde aranabilir
     subscribed_any = False
 
     for crn_code in unique(crn_codes):
@@ -564,7 +621,9 @@ async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler):
 
         ders = dersler_by_crn.get(crn_code) if dersler_by_crn is not None else None
         if dersler_by_crn is not None and ders is None:
-            results.append(f"❌ {crn_code}: {lesson_code} dersleri arasında bulunamadı. Ders kodunu ve CRN'i kontrol edin.")
+            results.append(f"❌ {crn_code}: {not_found_scope(lesson_code, seviye)} bulunamadı. Ders kodunu ve CRN'i kontrol edin.")
+            if seviye == LISANS:
+                not_found.append(crn_code)
             continue
 
         existing_subscription = find_subscription(user_id, lesson_code, crn_code)
@@ -577,10 +636,10 @@ async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler):
         if existing_subscription is not None:
             results.append(f'ℹ️ {label} için zaten abonesiniz.')
         else:
-            add_subscription(user_id, lesson_code, crn_code)
+            add_subscription(user_id, lesson_code, crn_code, seviye)
             subscribed_any = True
             results.append(f'✅ {label} için kontenjan durumunu kontrol etmeye başladım. Bu derse abone {count_crn_subscribers(crn_code)} kişi var.')
-            logger.info(f"{user_id} kullanıcısı {lesson_code} {crn_code} için kontenjan durumunu kontrol etmeye başladı.")
+            logger.info(f"{user_id} kullanıcısı {lesson_code} {crn_code} ({seviye}) için kontenjan durumunu kontrol etmeye başladı.")
 
         if ders and ders['rezervasyonlar']:
             bolum_prompts.append((ders, existing_subscription))
@@ -597,7 +656,10 @@ async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler):
         )
         return
 
-    await send_blocks(context.bot, user_id, results, parse_mode=None, separator="\n")
+    if not_found:
+        await send_not_found(context, user_id, results, 'sub', [lesson_code, *not_found])
+    else:
+        await send_blocks(context.bot, user_id, results, parse_mode=None, separator="\n")
     for ders, existing_subscription in bolum_prompts:
         await context.bot.send_message(
             chat_id=user_id,
@@ -605,8 +667,9 @@ async def subscribe_crns(context, user_id, lesson_code, crn_codes, dersler):
             reply_markup=build_bolum_keyboard(lesson_code, ders['crn'], ders['rezervasyonlar'])
         )
 
-def set_flow_state(context, state, branch=None):
-    """Adım adım abonelik bilgisini sonraki duruma göre günceller ve durumu döner. Akış bittiğinde bilgi silinir."""
+def set_flow_state(context, state, branch=None, seviye=LISANS):
+    """Adım adım abonelik bilgisini sonraki duruma göre günceller ve durumu döner. Akış bittiğinde bilgi silinir.
+    branch verilirse sonraki adımda yazılan ders numarası/CRN bu ders kodunun verilen seviyedeki derslerinde aranır."""
     if state == ConversationHandler.END:
         context.user_data.pop('subscribe_flow', None)
     else:
@@ -614,17 +677,19 @@ def set_flow_state(context, state, branch=None):
         flow['time'] = turkey_now()
         if branch is not None:
             flow['branch'] = branch
+            flow['seviye'] = seviye
     return state
 
 def subscribe_flow_expired(context):
     flow = context.user_data.get('subscribe_flow')
     return flow is None or turkey_now() - flow['time'] > SUBSCRIBE_FLOW_TIMEOUT
 
-async def handle_course_input(context, user_id, tokens, retry_state=None):
-    """/subscribe girdisini işler ve konuşmanın sonraki durumunu döner:
+async def handle_course_input(context, user_id, tokens, retry_state=None, seviye=LISANS):
+    """/subscribe girdisini verilen seviyedeki derslerde işler ve konuşmanın sonraki durumunu döner:
     - yalnızca ders kodu (BLG): ders numarası ya da CRN sorulur
     - ders kodu + ders numarası (BLG 102E): şubeler butonlarla listelenir
     - ders kodu + CRN'ler (BLG 13547 13548): doğrudan abone olunur
+    Ders lisans derslerinde bulunamazsa lisansüstü olup olmadığı sorulur; lisansüstü derslerde de bulunamazsa abonelik reddedilir.
     retry_state verilmişse (adım adım akış) hatalı girdide aynı soruda kalınır, verilmemişse (tek komut) akış biter."""
     fail_state = ConversationHandler.END if retry_state is None else retry_state
     if not tokens:
@@ -632,24 +697,31 @@ async def handle_course_input(context, user_id, tokens, retry_state=None):
         return set_flow_state(context, fail_state)
 
     lesson_code, rest = tokens[0], tokens[1:]
-    lesson_id = await take_option_value(lesson_code)
+    lesson_id = await take_option_value(lesson_code, seviye)
     if lesson_id is None:
         await context.bot.send_message(chat_id=user_id, text=OBS_UNREACHABLE_TEXT)
         return set_flow_state(context, fail_state)
     if lesson_id == -1:
-        await context.bot.send_message(chat_id=user_id, text=f'"{lesson_code}" geçerli bir ders kodu değil. Ders kodunu kontrol edip tekrar yazın (örn. BLG 102E ya da BLG 13547).')
+        if seviye == LISANS:
+            await send_not_found(context, user_id, [f'"{lesson_code}" geçerli bir ders kodu değil. Ders kodunu kontrol edip tekrar yazın (örn. BLG 102E ya da BLG 13547).'], 'sub', tokens)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=f'"{lesson_code}" lisansüstü derslerde de geçerli bir ders kodu değil. Ders kodunu kontrol edip tekrar yazın.')
         return set_flow_state(context, fail_state)
 
     if not rest:
-        await context.bot.send_message(chat_id=user_id, text=f"{lesson_code} dersinin numarasını (örn. 102E) ya da abone olmak istediğiniz CRN kodlarını yazın.\nİptal etmek için /cancel")
-        return set_flow_state(context, ASK_DETAIL, branch=lesson_code)
+        if seviye == LISANSUSTU:
+            text = f"{lesson_code} lisansüstü dersinin numarasını (örn. 501E) ya da abone olmak istediğiniz CRN kodlarını yazın.\nİptal etmek için /cancel"
+        else:
+            text = f"{lesson_code} dersinin numarasını (örn. 102E) ya da abone olmak istediğiniz CRN kodlarını yazın.\nİptal etmek için /cancel"
+        await context.bot.send_message(chat_id=user_id, text=text)
+        return set_flow_state(context, ASK_DETAIL, branch=lesson_code, seviye=seviye)
 
     # Ders programını çek: CRN'ler doğrulanır, ders numarası yazıldıysa şubeler bulunur
     try:
-        dersler = await fetch_lessons(lesson_code, lesson_id)
+        dersler = await fetch_lessons(lesson_code, lesson_id, seviye)
     except Exception as e:
         # Tablo çekilemezse eski davranış: doğrulama yapılmadan abone edilir, geçersiz CRN kontrol döngüsünde temizlenir
-        logger.warning(f"{lesson_code} için ders programı çekilemedi, CRN'ler doğrulanmadan devam ediliyor: {e}")
+        logger.warning(f"{lesson_code} ({seviye}) için ders programı çekilemedi, CRN'ler doğrulanmadan devam ediliyor: {e}")
         dersler = None
 
     if len(rest) == 1:
@@ -661,18 +733,22 @@ async def handle_course_input(context, user_id, tokens, retry_state=None):
                 return set_flow_state(context, ConversationHandler.END)
 
         if not is_valid_crn(rest[0]):  # CRN değil, ders numarası yazılmış
-            text = OBS_UNREACHABLE_TEXT if dersler is None else f"{course_code} için açılmış şube bulunamadı. Ders numarasını kontrol edin ya da CRN kodunu yazın."
-            await context.bot.send_message(chat_id=user_id, text=text)
+            if dersler is None:
+                await context.bot.send_message(chat_id=user_id, text=OBS_UNREACHABLE_TEXT)
+            elif seviye == LISANS:
+                await send_not_found(context, user_id, [f"{course_code} için açılmış şube bulunamadı. Ders numarasını kontrol edin ya da CRN kodunu yazın."], 'sub', tokens)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=f"{course_code} için lisansüstü derslerde de açılmış şube bulunamadı. Ders numarasını kontrol edin ya da CRN kodunu yazın.")
             return set_flow_state(context, fail_state)
 
-    await subscribe_crns(context, user_id, lesson_code, rest, dersler)
+    await subscribe_crns(context, user_id, lesson_code, rest, dersler, seviye)
     return set_flow_state(context, ConversationHandler.END)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('Merhaba! Kontenjan durumunu takip etmek istediğiniz derse abone olmak için /subscribe komutunu kullanın, ders kodunu ve şubeyi adım adım soracağım.\nCRN kodunu biliyorsanız doğrudan /subscribe <DERS_KODU> <CRN> yazabilirsiniz.\n(Yalnızca Lisans seviyesi dersler!)\n\nAbone olmadan anlık kontenjan sorgulamak için /check <DERS_KODU> <CRN>\nTüm komutları görmek için /help komutunu kullanın.')
+    await update.message.reply_text('Merhaba! Kontenjan durumunu takip etmek istediğiniz derse abone olmak için /subscribe komutunu kullanın, ders kodunu ve şubeyi adım adım soracağım.\nCRN kodunu biliyorsanız doğrudan /subscribe <DERS_KODU> <CRN> yazabilirsiniz.\nLisansüstü dersleri de takip edebilirsiniz: aradığınız ders lisans derslerinde bulunamazsa lisansüstü bir ders olup olmadığını sorarım.\n\nAbone olmadan anlık kontenjan sorgulamak için /check <DERS_KODU> <CRN>\nTüm komutları görmek için /help komutunu kullanın.')
 
 async def help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text('/subscribe  -  Adım adım abone ol (ders kodunu sorar, şubeleri listeler).\n/subscribe <DERS_KODU> <CRN> [CRN ...]  -  Bir veya birden fazla şubeye abone ol.\n/subscribe <DERS_KODU> <DERS_NO>  -  Dersin şubelerini listele, butonla abone ol.\n/check <DERS_KODU> <CRN> [CRN ...]  -  Abone olmadan anlık kontenjan sorgula.\n/sublist  -  Aboneliklerini ve güncel doluluklarını göster, butonla çık.\n/unsubscribe <DERS_KODU> <CRN> [CRN ...]  -  Abonelikten ayrıl.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/cancel - Adım adım abonelik işlemini iptal et.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547 13548", "/subscribe BLG 102E", "/check BLG 13547" \nDers kodlarını büyük ya da küçük harfle yazabilirsiniz.\n\nBu bot abone olduğunuz derslerin kontenjan durumlarını belirli aralıklarla kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız. Kontenjan tekrar dolduğunda bir kez "kontenjan doldu" mesajı alırsınız.\nNOT: Bir ders için kontenjan var mesajı aldıktan sonra spama düşmemek amacıyla aynı ders için sonraki 3 dakika boyunca mesaj almazsınız, diğer derslerin kontrolü devam eder. \nKontenjanı bölümlere ayrılmış derslerde (örn. YZVE_LS/10/7 | Diğer/70/70) abone olurken bölümünüzü seçebilirsiniz; böylece yalnızca kendi bölümünüzün kontenjanı açıldığında bildirim alırsınız. \n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer admin tarafından kapatıldığı durumda kullanıcılara bilgilendirme mesajı gönderilecektir.')
+    await update.message.reply_text('/subscribe  -  Adım adım abone ol (ders kodunu sorar, şubeleri listeler).\n/subscribe <DERS_KODU> <CRN> [CRN ...]  -  Bir veya birden fazla şubeye abone ol.\n/subscribe <DERS_KODU> <DERS_NO>  -  Dersin şubelerini listele, butonla abone ol.\n/check <DERS_KODU> <CRN> [CRN ...]  -  Abone olmadan anlık kontenjan sorgula.\n/sublist  -  Aboneliklerini ve güncel doluluklarını göster, butonla çık.\n/unsubscribe <DERS_KODU> <CRN> [CRN ...]  -  Abonelikten ayrıl.\n/clearall - Aktif tüm aboneliklerden ayrıl.\n/cancel - Adım adım abonelik işlemini iptal et.\n/sendmessage <MESAJ> - Admine şikayet veya önerilerinizi gönderebilirsiniz\n\nÖrnek kullanım: "/subscribe BLG 13547 13548", "/subscribe BLG 102E", "/check BLG 13547" \nDers kodlarını büyük ya da küçük harfle yazabilirsiniz.\n\nBu bot abone olduğunuz derslerin kontenjan durumlarını belirli aralıklarla kontrol eder. Eğer boş yer varsa size bildirir. Boş yer açılana kadar mesaj almazsınız. Kontenjan tekrar dolduğunda bir kez "kontenjan doldu" mesajı alırsınız.\nNOT: Bir ders için kontenjan var mesajı aldıktan sonra spama düşmemek amacıyla aynı ders için sonraki 3 dakika boyunca mesaj almazsınız, diğer derslerin kontrolü devam eder. \nKontenjanı bölümlere ayrılmış derslerde (örn. YZVE_LS/10/7 | Diğer/70/70) abone olurken bölümünüzü seçebilirsiniz; böylece yalnızca kendi bölümünüzün kontenjanı açıldığında bildirim alırsınız. \nLisansüstü dersler: Yazdığınız ders lisans dersleri arasında bulunamazsa lisansüstü bir ders olup olmadığı sorulur. "Evet" derseniz ders lisansüstü dersler arasında aranır ve aboneliğiniz lisansüstü ders olarak kaydedilir. \n\nDikkat: Bu bot şu anda çalışıyor olsa bile ilerleyen zamanda bilgi işlemin yapabileceği değişikliklerden etkilenebilir ve görevini yapamayabilir. Ya da ben serveri kapatabilirim :D\nServer admin tarafından kapatıldığı durumda kullanıcılara bilgilendirme mesajı gönderilecektir.')
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     remember_user(update)
@@ -681,7 +757,7 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not tokens:  # Argümansız kullanım: adım adım abonelik
         await update.message.reply_text('Hangi dersi takip etmek istiyorsunuz? Ders kodunu yazın.\n'
                                         '"BLG 102E" yazarsanız şubeleri listelerim, "BLG 13547" yazarsanız doğrudan abone olursunuz.\n'
-                                        '(Yalnızca Lisans seviyesi dersler!)\n\nİptal etmek için /cancel')
+                                        'Lisansüstü dersler için de aynı şekilde yazın, ders lisans derslerinde bulunamazsa lisansüstü olup olmadığını sorarım.\n\nİptal etmek için /cancel')
         return set_flow_state(context, ASK_COURSE)
 
     return await handle_course_input(context, update.effective_chat.id, tokens)
@@ -702,10 +778,13 @@ async def subscribe_detail_input(update: Update, context: ContextTypes.DEFAULT_T
 
     remember_user(update)
     tokens = tokenize_course_input(update.message.text)
-    branch = context.user_data['subscribe_flow'].get('branch')
+    flow = context.user_data['subscribe_flow']
+    branch = flow.get('branch')
     if tokens and branch and not tokens[0].isalpha():  # "102E" ya da "13547 13548" yazıldı
         tokens.insert(0, branch)
-    return await handle_course_input(context, update.effective_chat.id, tokens, retry_state=ASK_DETAIL)
+    # Önceki adımdaki ders kodu, o adımda seçilen seviyede (lisans/lisansüstü) aranır; başka bir ders kodu yazıldıysa önce lisans derslerine bakılır
+    seviye = flow.get('seviye', LISANS) if tokens and tokens[0] == branch else LISANS
+    return await handle_course_input(context, update.effective_chat.id, tokens, retry_state=ASK_DETAIL, seviye=seviye)
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text('Abonelik işlemi iptal edildi.')
@@ -715,17 +794,44 @@ async def cancel_idle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text('İptal edilecek bir işlem yok.')
 
 async def subscribe_busy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Önceki abonelik isteği (OBS sorgusu) sürerken aynı kullanıcıdan gelen abonelik mesajları."""
-    await update.message.reply_text('⏳ Önceki isteğiniz işleniyor, lütfen birkaç saniye sonra tekrar deneyin.')
+    """Önceki abonelik isteği (OBS sorgusu) sürerken aynı kullanıcıdan gelen abonelik mesajları ve lisansüstü butonları."""
+    text = '⏳ Önceki isteğiniz işleniyor, lütfen birkaç saniye sonra tekrar deneyin.'
+    if update.callback_query:
+        await update.callback_query.answer(text)
+    else:
+        await update.message.reply_text(text)
+
+async def graduate_subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Abonelikteki 'lisansüstü mü?' sorusuna Evet denirse girdiyi lisansüstü (LU) derslerde tekrar arar. callback_data: lu|sub|<girdi>
+    Adım adım aboneliğin giriş noktasıdır: yalnızca ders kodu yazılmışsa lisansüstü ders numarası adımına geçilir."""
+    query = update.callback_query
+    await close_graduate_question(query, '🎓 Lisansüstü derslerde aranıyor…')
+    remember_user(update)
+    tokens = query.data.split('|', 2)[2].split()
+    return await handle_course_input(context, update.effective_chat.id, tokens, seviye=LISANSUSTU)
+
+async def graduate_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/check'teki 'lisansüstü mü?' sorusuna Evet (lu|chk|<girdi>) ve tüm sorulardaki Hayır (lu|no) butonu."""
+    query = update.callback_query
+    if query.data == 'lu|no':
+        await close_graduate_question(query, 'Tamam, lisansüstü derslerde aranmayacak.')
+        return
+
+    await close_graduate_question(query, '🎓 Lisansüstü derslerde aranıyor…')
+    remember_user(update)
+    tokens = query.data.split('|', 2)[2].split()
+    await run_check(context, update.effective_chat.id, tokens, LISANSUSTU)
 
 async def subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Şube listesindeki ya da /check sonucundaki abone ol butonuna basıldığında abone eder. callback_data: sub|<ders_kodu>|<crn>"""
+    """Şube listesindeki ya da /check sonucundaki abone ol butonuna basıldığında abone eder. callback_data: sub|<ders_kodu>|<crn>|<seviye>
+    Seviye eklenmeden önce gönderilmiş butonlarda seviye bulunmaz, bunlar lisans dersleridir."""
     query = update.callback_query
-    parts = query.data.split('|', 2)
-    if len(parts) != 3:
+    parts = query.data.split('|')
+    if len(parts) not in (3, 4):
         await query.answer()
         return
-    _, lesson_code, crn_code = parts
+    lesson_code, crn_code = parts[1], parts[2]
+    seviye = parts[3] if len(parts) == 4 else LISANS
     user_id = update.effective_chat.id
 
     if find_subscription(user_id, lesson_code, crn_code) is not None:
@@ -734,23 +840,23 @@ async def subscribe_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer()
 
-    lesson_id = await take_option_value(lesson_code)
+    lesson_id = await take_option_value(lesson_code, seviye)
     if lesson_id is None or lesson_id == -1:
         await context.bot.send_message(chat_id=user_id, text=OBS_UNREACHABLE_TEXT if lesson_id is None else f'"{lesson_code}" geçerli bir ders kodu değil.')
         return
 
     ders = crn_details.get(crn_code)
-    if ders is not None and turkey_now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
+    if ders is not None and ders['seviye'] == seviye and turkey_now() - ders['guncelleme'] <= DETAIL_CACHE_TTL:
         dersler = [ders]  # Liste az önce çekildi, tekrar istek atılmaz
     else:
         try:
-            dersler = await fetch_lessons(lesson_code, lesson_id)
+            dersler = await fetch_lessons(lesson_code, lesson_id, seviye)
         except Exception as e:
-            logger.warning(f"{lesson_code} için ders programı çekilemedi, {crn_code} doğrulanmadan devam ediliyor: {e}")
+            logger.warning(f"{lesson_code} ({seviye}) için ders programı çekilemedi, {crn_code} doğrulanmadan devam ediliyor: {e}")
             dersler = None
 
     remember_user(update)
-    await subscribe_crns(context, user_id, lesson_code, [crn_code], dersler)
+    await subscribe_crns(context, user_id, lesson_code, [crn_code], dersler, seviye)
     if find_subscription(user_id, lesson_code, crn_code) is not None:
         await mark_subscribed_button(query)
 
@@ -810,28 +916,34 @@ async def bolum_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Abone olmadan anlık kontenjan sorgusu: /check <DERS_KODU> <CRN> [CRN ...] ya da /check <DERS_KODU> <DERS_NO>"""
     remember_user(update)
-    user_id = update.effective_chat.id
     tokens = tokenize_course_input(" ".join(context.args))
     if len(tokens) < 2:
         await update.message.reply_text('Lütfen geçerli formatta giriş yapın: /check <DERS_KODU> <CRN> [CRN ...]\nÖrnek: "/check BLG 13547" ya da bir dersin tüm şubeleri için "/check BLG 102E"')
         return
 
+    await run_check(context, update.effective_chat.id, tokens, LISANS)
+
+async def run_check(context, user_id, tokens, seviye):
+    """/check sorgusunu verilen seviyedeki (LS/LU) derslerde yapar. Lisans derslerinde bulunamayanlar için dersin lisansüstü olup olmadığı sorulur."""
     lesson_code, crn_codes = tokens[0], unique(tokens[1:])
-    lesson_id = await take_option_value(lesson_code)
+    lesson_id = await take_option_value(lesson_code, seviye)
     if lesson_id is None:
-        await update.message.reply_text(OBS_UNREACHABLE_TEXT)
+        await context.bot.send_message(chat_id=user_id, text=OBS_UNREACHABLE_TEXT)
         return
     if lesson_id == -1:
-        await update.message.reply_text(f'"{lesson_code}" geçerli bir ders kodu değil: /check <DERS_KODU> <CRN>')
+        if seviye == LISANS:
+            await send_not_found(context, user_id, [f'"{lesson_code}" geçerli bir ders kodu değil: /check <DERS_KODU> <CRN>'], 'chk', tokens)
+        else:
+            await context.bot.send_message(chat_id=user_id, text=f'"{lesson_code}" lisansüstü derslerde de geçerli bir ders kodu değil.')
         return
 
     try:
-        dersler = await fetch_lessons(lesson_code, lesson_id)
+        dersler = await fetch_lessons(lesson_code, lesson_id, seviye)
     except Exception as e:
-        logger.warning(f"/check sırasında {lesson_code} ders programı çekilemedi: {e}")
-        await update.message.reply_text(OBS_UNREACHABLE_TEXT)
+        logger.warning(f"/check sırasında {lesson_code} ({seviye}) ders programı çekilemedi: {e}")
+        await context.bot.send_message(chat_id=user_id, text=OBS_UNREACHABLE_TEXT)
         return
-    
+
     dersler_by_crn = {ders['crn']: ders for ders in dersler}
     if len(crn_codes) == 1 and crn_codes[0] not in dersler_by_crn:  # Ders numarası yazıldıysa tüm şubeleri listele
         sections = find_sections(dersler, f"{lesson_code} {crn_codes[0]}")
@@ -841,18 +953,26 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     blocks = []
     buttons = []
+    not_found = []
     for crn_code in crn_codes:
         ders = dersler_by_crn.get(crn_code)
         if ders is None:
-            blocks.append(f"❌ {html_escape(crn_code)}: {lesson_code} dersleri arasında bulunamadı.")
+            not_found.append(crn_code)
             continue
         blocks.append(format_check_block(ders))
         buttons.append(sub_button(lesson_code, ders, find_subscription(user_id, lesson_code, crn_code) is not None))
 
-    if any(button.text.startswith('🔔') for button in buttons):
-        blocks.append("🔔 butonlarına dokunarak abone olabilirsiniz.")
-    reply_markup = InlineKeyboardMarkup(button_rows(buttons)) if buttons else None
-    await send_blocks(context.bot, user_id, blocks, reply_markup)
+    if blocks:
+        if any(button.text.startswith('🔔') for button in buttons):
+            blocks.append("🔔 butonlarına dokunarak abone olabilirsiniz.")
+        await send_blocks(context.bot, user_id, blocks, InlineKeyboardMarkup(button_rows(buttons)))
+
+    if not_found:  # Bulunamayanlar ayrı mesajda: lisansüstü sorusunun butonları abone ol butonlarına karışmaz
+        lines = [f"❌ {html_escape(crn_code)}: {not_found_scope(lesson_code, seviye)} bulunamadı." for crn_code in not_found]
+        if seviye == LISANS:
+            await send_not_found(context, user_id, lines, 'chk', [lesson_code, *not_found], parse_mode=ParseMode.HTML)
+        else:
+            await send_blocks(context.bot, user_id, lines, separator="\n")
 
 async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tokens = tokenize_course_input(" ".join(context.args))
@@ -904,12 +1024,14 @@ def build_sublist(user_id):
     full_entries = []   # Ders adı ve bölüm bilgisiyle ayrıntılı liste
     short_entries = []  # Çok sayıda abonelikte kullanılan tek satırlık liste
     update_times = []
-    for index, (lesson_code, crn_code, bolum) in enumerate(user_subs, 1):
+    for index, (lesson_code, crn_code, bolum, seviye) in enumerate(user_subs, 1):
         bolum_note = f" · {html_escape(bolum)}" if bolum else ""
+        seviye_note = " · 🎓 Lisansüstü" if seviye == LISANSUSTU else ""
+        short_seviye_note = " · 🎓" if seviye == LISANSUSTU else ""
         ders = crn_details.get(crn_code)
         if ders is None:
-            full_entries.append(f"<b>{index}. {html_escape(lesson_code)}</b> · CRN {html_escape(crn_code)}{bolum_note}\n⏳ Kontenjan bilgisi henüz alınmadı")
-            short_entries.append(f"{index}. {html_escape(lesson_code)} {html_escape(crn_code)} · ⏳{bolum_note}")
+            full_entries.append(f"<b>{index}. {html_escape(lesson_code)}</b> · CRN {html_escape(crn_code)}{seviye_note}{bolum_note}\n⏳ Kontenjan bilgisi henüz alınmadı")
+            short_entries.append(f"{index}. {html_escape(lesson_code)} {html_escape(crn_code)} · ⏳{bolum_note}{short_seviye_note}")
             continue
 
         update_times.append(ders['guncelleme'])
@@ -920,10 +1042,10 @@ def build_sublist(user_id):
         elif bolum:
             status += f" (seçtiğiniz {html_escape(bolum)} bölümünün ayrı kontenjanı kalmadı, toplam kontenjan takip ediliyor)"
 
-        full_entries.append(f"<b>{index}. {html_escape(ders['dersKodu'])}</b> · CRN {html_escape(crn_code)}\n"
+        full_entries.append(f"<b>{index}. {html_escape(ders['dersKodu'])}</b> · CRN {html_escape(crn_code)}{seviye_note}\n"
                             f"<i>{html_escape(ders['dersAdi'])}</i>\n"
                             f"{status}")
-        short_entries.append(f"{index}. {html_escape(ders['dersKodu'])} {html_escape(crn_code)} · {capacity_status(yazilan, kontenjan)}{bolum_note}")
+        short_entries.append(f"{index}. {html_escape(ders['dersKodu'])} {html_escape(crn_code)} · {capacity_status(yazilan, kontenjan)}{bolum_note}{short_seviye_note}")
 
     header = f"📋 <b>Abonelikleriniz ({len(user_subs)})</b>"
     footer = []
@@ -944,7 +1066,7 @@ def build_sublist(user_id):
         text = "\n".join(lines + [""] + footer)
 
     buttons = [InlineKeyboardButton(f"❌ Çık: {crn_code}", callback_data=f"unsub|{lesson_code}|{crn_code}")
-               for lesson_code, crn_code, _ in user_subs[:MAX_SUBLIST_BUTTONS]]
+               for lesson_code, crn_code, _, _ in user_subs[:MAX_SUBLIST_BUTTONS]]
     rows = button_rows(buttons)
     rows.append([InlineKeyboardButton("🔄 Yenile", callback_data="sublist|refresh")])
     return text, InlineKeyboardMarkup(rows)
@@ -1012,43 +1134,45 @@ async def updateallusers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info(f"Request Count: {request_count}")
 
 async def check_capacity_optimized(context):
-    lesson_codes = {lesson_code for user_subs in subscriptions.values() for lesson_code, _, _ in user_subs}
+    # Lisans ve lisansüstü dersler ayrı tablolarda olduğu için ders kodu seviyesiyle birlikte gruplanır
+    lessons = {(lesson_code, seviye) for user_subs in subscriptions.values() for lesson_code, _, _, seviye in user_subs}
 
-    # Her ders kodu için sadece bir istek atılacak
-    for lesson_code in lesson_codes:
+    # Her ders kodu ve seviye için sadece bir istek atılacak
+    for lesson_code, seviye in lessons:
         try:
-            await check_lesson(context, lesson_code)
+            await check_lesson(context, lesson_code, seviye)
         except Exception as e:
-            logger.error(f"{lesson_code} kontrol edilirken hata oluştu: {e}")
+            logger.error(f"{lesson_code} ({seviye}) kontrol edilirken hata oluştu: {e}")
 
     await asyncio.sleep(5)
 
-async def check_lesson(context, lesson_code):
-    """Bir ders kodunun ders programını tek istekle çeker, geçersiz CRN'leri temizler ve abonelere bildirim gönderir."""
-    lesson_id = await take_option_value(lesson_code)
+async def check_lesson(context, lesson_code, seviye):
+    """Bir ders kodunun verilen seviyedeki (LS/LU) ders programını tek istekle çeker, geçersiz CRN'leri temizler ve abonelere bildirim gönderir."""
+    lesson_id = await take_option_value(lesson_code, seviye)
     if lesson_id is None:
-        logger.warning(f"Branş kodları alınamadığı için {lesson_code} kontrol edilemedi.")
+        logger.warning(f"Branş kodları alınamadığı için {lesson_code} ({seviye}) kontrol edilemedi.")
         return
     if lesson_id == -1:
-        logger.warning(f"Geçersiz ders kodu: {lesson_code}")
+        logger.warning(f"Geçersiz ders kodu: {lesson_code} ({seviye})")
         return
 
     try:
-        dersler = await fetch_lessons(lesson_code, lesson_id)
+        dersler = await fetch_lessons(lesson_code, lesson_id, seviye)
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ders kodu {lesson_code} için istek atılırken hata oluştu: {e}")
+        logger.error(f"Ders kodu {lesson_code} ({seviye}) için istek atılırken hata oluştu: {e}")
         return
     except Exception as e:
-        logger.error(f"HTML parse edilirken hata oluştu {lesson_code}: {e}")
+        logger.error(f"HTML parse edilirken hata oluştu {lesson_code} ({seviye}): {e}")
         return
 
     dersler_by_crn = {ders['crn']: ders for ders in dersler}
 
-    # Aboneler istekten sonra alınır, istek sürerken abone olan/ayrılan kullanıcılar da hesaba katılır
+    # Aboneler istekten sonra alınır, istek sürerken abone olan/ayrılan kullanıcılar da hesaba katılır.
+    # Yalnızca bu seviyedeki abonelikler alınır: diğer seviyedeki CRN'ler bu tabloda olmadığı için geçersiz sayılıp silinirdi.
     subscribers_by_crn = {}  # crn -> {user_id: bolum}
     for user_id, user_subs in subscriptions.items():
-        for sub_lesson, crn_code, bolum in user_subs:
-            if sub_lesson == lesson_code:
+        for sub_lesson, crn_code, bolum, sub_seviye in user_subs:
+            if sub_lesson == lesson_code and sub_seviye == seviye:
                 subscribers_by_crn.setdefault(crn_code, {}).setdefault(user_id, bolum)
 
     # Check for invalid CRNs and remove subscriptions. Boş tablo geçici bir OBS hatası olabileceği için abonelikler silinmez.
@@ -1273,9 +1397,10 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     crn_stats = {}     # (ders_kodu, crn) -> {'subs': abone sayısı, 'bolumler': {bölüm: abone sayısı}}
-    lesson_stats = {}  # ders_kodu -> {'subs': abonelik sayısı, 'users': kullanıcılar, 'crns': crn kodları}
+    lesson_stats = {}  # (ders_kodu, seviye) -> {'subs': abonelik sayısı, 'users': kullanıcılar, 'crns': crn kodları}
     active_users = 0
     total_subscriptions = 0
+    graduate_subscriptions = 0
 
     for user_id, user_subs in subscriptions.items():
         if not user_subs:
@@ -1284,13 +1409,15 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
         active_users += 1
         total_subscriptions += len(user_subs)
 
-        for lesson_code, crn_code, bolum in user_subs:
+        for lesson_code, crn_code, bolum, seviye in user_subs:
             crn = crn_stats.setdefault((lesson_code, crn_code), {'subs': 0, 'bolumler': {}})
             crn['subs'] += 1
             if bolum is not None:
                 crn['bolumler'][bolum] = crn['bolumler'].get(bolum, 0) + 1
+            if seviye == LISANSUSTU:
+                graduate_subscriptions += 1
 
-            lesson = lesson_stats.setdefault(lesson_code, {'subs': 0, 'users': set(), 'crns': set()})
+            lesson = lesson_stats.setdefault((lesson_code, seviye), {'subs': 0, 'users': set(), 'crns': set()})
             lesson['subs'] += 1
             lesson['users'].add(user_id)
             lesson['crns'].add(crn_code)
@@ -1302,6 +1429,7 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append(f'Kayıtlı kullanıcı: {len(subscriptions)}')
     lines.append(f'Aktif aboneliği olan kullanıcı: {active_users}')
     lines.append(f'Toplam abonelik: {total_subscriptions}')
+    lines.append(f'Lisansüstü abonelik: {graduate_subscriptions}')
     lines.append(f'Farklı ders kodu: {len(lesson_stats)}')
     lines.append(f'Farklı CRN: {len(crn_stats)}')
     lines.append(f'Aktif kullanıcı başına ortalama abonelik: {avg_per_user:.2f}')
@@ -1309,8 +1437,9 @@ async def subscription_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     lines.append('')
     lines.append('=== Ders Kodu Bazında ===')
     if lesson_stats:
-        for lesson_code, data in sorted(lesson_stats.items(), key=lambda item: item[1]['subs'], reverse=True):
-            lines.append(f"{lesson_code}: {data['subs']} abonelik | {len(data['users'])} kullanıcı | {len(data['crns'])} CRN")
+        for (lesson_code, seviye), data in sorted(lesson_stats.items(), key=lambda item: item[1]['subs'], reverse=True):
+            label = f"{lesson_code} (lisansüstü)" if seviye == LISANSUSTU else lesson_code
+            lines.append(f"{label}: {data['subs']} abonelik | {len(data['users'])} kullanıcı | {len(data['crns'])} CRN")
     else:
         lines.append('Aktif abonelik yok.')
 
@@ -1389,20 +1518,28 @@ def add_handlers(application):
     """Komut ve buton işleyicilerini uygulamaya ekler."""
     # Tek komutla (/subscribe BLG 13547) ya da adım adım (/subscribe) abonelik.
     # block=False: OBS sorgusu sürerken diğer kullanıcıların komutları bekletilmez.
-    subscribe_conversation = ConversationHandler(
-        entry_points=[CommandHandler("subscribe", subscribe)],
-        states={
-            ASK_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_course_input)],
-            ASK_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_detail_input)],
-            ConversationHandler.WAITING: [  # Önceki istek bitmeden gelen abonelik mesajları sessizce kaybolmasın
-                CommandHandler(["subscribe", "cancel"], subscribe_busy),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_busy),
+    # Aboneliğin "lisansüstü mü?" butonu da giriş noktasıdır: yalnızca ders kodu yazılmışsa lisansüstü ders numarası adımına geçilir.
+    # Buton konuşmayı mesaja göre değil kullanıcıya göre sürdürür (per_message=False); PTB'nin bu kullanım için verdiği uyarı gizlenir.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="If 'per_message=False'", category=PTBUserWarning)
+        subscribe_conversation = ConversationHandler(
+            entry_points=[
+                CommandHandler("subscribe", subscribe),
+                CallbackQueryHandler(graduate_subscribe_callback, pattern=r"^lu\|sub\|"),
             ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-        block=False,
-    )
+            states={
+                ASK_COURSE: [MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_course_input)],
+                ASK_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_detail_input)],
+                ConversationHandler.WAITING: [  # Önceki istek bitmeden gelen abonelik mesajları sessizce kaybolmasın
+                    CommandHandler(["subscribe", "cancel"], subscribe_busy),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, subscribe_busy),
+                    CallbackQueryHandler(subscribe_busy, pattern=r"^lu\|sub\|"),
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            block=False,
+        )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(subscribe_conversation)
@@ -1422,6 +1559,7 @@ def add_handlers(application):
     application.add_handler(CommandHandler("substats", subscription_stats))  # Detaylı abonelik analizi komutu
     application.add_handler(CallbackQueryHandler(bolum_callback, pattern=r"^bolum\|"))  # Bölüm seçimi butonları
     application.add_handler(CallbackQueryHandler(subscribe_callback, pattern=r"^sub\|", block=False))  # Şube listesi / check abone ol butonları
+    application.add_handler(CallbackQueryHandler(graduate_callback, pattern=r"^lu\|(chk\||no$)", block=False))  # /check'teki lisansüstü sorusu ve Hayır butonları
     application.add_handler(CallbackQueryHandler(sublist_callback, pattern=r"^(unsub|sublist)\|"))  # Abonelik listesi Çık / Yenile butonları
 
 # Sohbetteki "/" komut menüsünde görünen kullanıcı komutları. Admin komutları bilerek eklenmedi.
